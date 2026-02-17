@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""
+Qase Workspace Migration Script
+
+Migrates all content from one Qase workspace to another, preserving structure,
+links, attachments, and relationships.
+"""
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+from typing import Optional
+
+from qase_service import QaseService
+from migration.utils import MigrationMappings, MigrationStats
+from migration.create import (
+    migrate_projects,
+    migrate_users,
+    migrate_custom_fields,
+    migrate_attachments_workspace,
+    migrate_milestones,
+    migrate_configurations,
+    migrate_shared_steps,
+    migrate_suites,
+    migrate_cases,
+    migrate_runs,
+    migrate_results
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('migration.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+def load_config(config_path: str) -> dict:
+    """Load configuration from JSON file."""
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        return config
+    except FileNotFoundError:
+        logger.error(f"Config file not found: {config_path}")
+        raise
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in config file: {e}")
+        raise
+
+
+def parse_args():
+    """Parse command line arguments - loads from config.json by default."""
+    config_path = 'config.json'
+    config_defaults = {}
+    
+    if Path(config_path).exists():
+        try:
+            config = load_config(config_path)
+            source_config = config.get('source', {})
+            target_config = config.get('target', {})
+            options_config = config.get('options', {})
+            
+            config_defaults = {
+                'source_token': source_config.get('api_token'),
+                'source_host': source_config.get('host', 'qase.io'),
+                'source_enterprise': source_config.get('enterprise', False),
+                'source_ssl': source_config.get('ssl', True),
+                'target_token': target_config.get('api_token'),
+                'target_host': target_config.get('host', 'qase.io'),
+                'target_enterprise': target_config.get('enterprise', False),
+                'target_ssl': target_config.get('ssl', True),
+                'mappings_file': options_config.get('mappings_file', 'mappings.json'),
+                'preserve_ids': options_config.get('preserve_ids', False),
+                'skip_projects': options_config.get('skip_projects') or [],
+                'only_projects': options_config.get('only_projects') or [],
+                'resume': options_config.get('resume', False),
+            }
+        except Exception as e:
+            logger.warning(f"Could not load config.json: {e}. Using command-line arguments only.")
+    
+    parser = argparse.ArgumentParser(
+        description='Migrate Qase workspace from source to target (reads from config.json by default)'
+    )
+    
+    parser.add_argument('--source-token', default=config_defaults.get('source_token'),
+                       help='Source workspace API token')
+    parser.add_argument('--source-host', default=config_defaults.get('source_host', 'qase.io'),
+                       help='Source workspace host (default: qase.io)')
+    parser.add_argument('--source-enterprise', action='store_true',
+                       help='Source is enterprise instance')
+    parser.add_argument('--source-ssl', action='store_true', 
+                       help='Use SSL for source')
+    
+    parser.add_argument('--target-token', default=config_defaults.get('target_token'),
+                       help='Target workspace API token')
+    parser.add_argument('--target-host', default=config_defaults.get('target_host', 'qase.io'),
+                       help='Target workspace host (default: qase.io)')
+    parser.add_argument('--target-enterprise', action='store_true',
+                       help='Target is enterprise instance')
+    parser.add_argument('--target-ssl', action='store_true',
+                       help='Use SSL for target')
+    
+    parser.add_argument('--mappings-file', default=config_defaults.get('mappings_file', 'mappings.json'),
+                       help='File to save/load ID mappings (default: mappings.json)')
+    parser.add_argument('--preserve-ids', action='store_true',
+                       help='Preserve entity IDs when possible')
+    parser.add_argument('--skip-projects', nargs='+',
+                       default=config_defaults.get('skip_projects'),
+                       help='List of project codes to skip')
+    parser.add_argument('--only-projects', nargs='+',
+                       default=config_defaults.get('only_projects'),
+                       help='List of project codes to migrate (only these)')
+    parser.add_argument('--resume', action='store_true',
+                       help='Resume migration from saved mappings')
+    
+    args = parser.parse_args()
+    
+    if config_defaults:
+        if not args.source_enterprise:
+            args.source_enterprise = config_defaults.get('source_enterprise', False)
+        if not args.source_ssl:
+            args.source_ssl = config_defaults.get('source_ssl', True)
+        if not args.target_enterprise:
+            args.target_enterprise = config_defaults.get('target_enterprise', False)
+        if not args.target_ssl:
+            args.target_ssl = config_defaults.get('target_ssl', True)
+        if not args.preserve_ids:
+            args.preserve_ids = config_defaults.get('preserve_ids', False)
+        if not args.resume:
+            args.resume = config_defaults.get('resume', False)
+    
+    if not args.source_token:
+        parser.error("--source-token is required (or provide config.json with source.api_token)")
+    if not args.target_token:
+        parser.error("--target-token is required (or provide config.json with target.api_token)")
+    
+    return args
+
+
+def main():
+    """Main migration function."""
+    args = parse_args()
+    
+    logger.info("="*60)
+    logger.info("QASE WORKSPACE MIGRATION")
+    logger.info("="*60)
+    logger.info(f"Source: {args.source_host}")
+    logger.info(f"Target: {args.target_host}")
+    logger.info("="*60)
+    
+    source_service = QaseService(
+        api_token=args.source_token,
+        host=args.source_host,
+        ssl=args.source_ssl,
+        enterprise=args.source_enterprise
+    )
+    
+    target_service = QaseService(
+        api_token=args.target_token,
+        host=args.target_host,
+        ssl=args.target_ssl,
+        enterprise=args.target_enterprise
+    )
+    
+    mappings = MigrationMappings()
+    stats = MigrationStats()
+    
+    if args.resume:
+        mappings.load_from_file(args.mappings_file)
+    
+    try:
+        logger.info("\n" + "="*60)
+        logger.info("STEP 1: Migrating Projects")
+        logger.info("="*60)
+        projects = migrate_projects(
+            source_service, 
+            target_service, 
+            mappings, 
+            stats,
+            only_projects=args.only_projects if args.only_projects else None
+        )
+        
+        if args.skip_projects:
+            projects = [p for p in projects if p['source_code'] not in args.skip_projects]
+        
+        if not projects:
+            logger.error("No projects to migrate!")
+            return
+        
+        logger.info(f"Found {len(projects)} project(s) to migrate")
+        
+        mappings.save_to_file(args.mappings_file)
+        
+        logger.info("\n" + "="*60)
+        logger.info("STEP 2: Mapping Users (Workspace Level)")
+        logger.info("="*60)
+        user_mapping = migrate_users(source_service, target_service, mappings, stats)
+        mappings.save_to_file(args.mappings_file)
+        
+        logger.info("\n" + "="*60)
+        logger.info("STEP 3: Migrating Custom Fields (Workspace Level)")
+        logger.info("="*60)
+        custom_field_mapping = migrate_custom_fields(
+            source_service, target_service,
+            mappings, stats
+        )
+        mappings.save_to_file(args.mappings_file)
+        
+        logger.info("\n" + "="*60)
+        logger.info("STEP 4: Migrating Attachments (Workspace Level)")
+        logger.info("="*60)
+        attachment_mapping = migrate_attachments_workspace(
+            source_service, target_service,
+            projects, mappings, stats
+        )
+        mappings.save_to_file(args.mappings_file)
+        
+        for project in projects:
+            project_code_source = project['source_code']
+            project_code_target = project['target_code']
+            
+            logger.info("\n" + "="*60)
+            logger.info(f"Migrating project: {project_code_source} -> {project_code_target}")
+            logger.info("="*60)
+            
+            logger.info(f"\nMigrating milestones for {project_code_source}...")
+            try:
+                milestone_mapping = migrate_milestones(
+                    source_service, target_service,
+                    project_code_source, project_code_target,
+                    mappings, stats
+                )
+                mappings.save_to_file(args.mappings_file)
+            except Exception as e:
+                logger.error(f"✗ Milestones migration failed: {e}", exc_info=True)
+                milestone_mapping = {}
+                mappings.save_to_file(args.mappings_file)
+            
+            logger.info(f"\nMigrating configurations for {project_code_source}...")
+            try:
+                config_group_mapping, config_mapping = migrate_configurations(
+                    source_service, target_service,
+                    project_code_source, project_code_target,
+                    mappings, stats
+                )
+                mappings.save_to_file(args.mappings_file)
+            except Exception as e:
+                logger.error(f"✗ Configurations migration failed: {e}", exc_info=True)
+                config_group_mapping = {}
+                config_mapping = {}
+                mappings.save_to_file(args.mappings_file)
+            
+            logger.info(f"\nMigrating shared steps for {project_code_source}...")
+            try:
+                shared_step_mapping = migrate_shared_steps(
+                    source_service, target_service,
+                    project_code_source, project_code_target,
+                    mappings, stats
+                )
+                mappings.save_to_file(args.mappings_file)
+            except Exception as e:
+                logger.error(f"✗ Shared steps migration failed: {e}", exc_info=True)
+                shared_step_mapping = {}
+                mappings.save_to_file(args.mappings_file)
+            
+            logger.info(f"\nMigrating suites for {project_code_source}...")
+            try:
+                suite_mapping = migrate_suites(
+                    source_service, target_service,
+                    project_code_source, project_code_target,
+                    mappings, stats
+                )
+                mappings.save_to_file(args.mappings_file)
+            except Exception as e:
+                logger.error(f"✗ Suites migration failed: {e}", exc_info=True)
+                suite_mapping = {}
+                mappings.save_to_file(args.mappings_file)
+            
+            logger.info(f"\nMigrating test cases for {project_code_source}...")
+            try:
+                case_mapping = migrate_cases(
+                    source_service, target_service,
+                    project_code_source, project_code_target,
+                    suite_mapping,
+                    custom_field_mapping,
+                    milestone_mapping,
+                    shared_step_mapping,
+                    user_mapping,
+                    mappings,
+                    stats,
+                    preserve_ids=args.preserve_ids
+                )
+                mappings.save_to_file(args.mappings_file)
+            except Exception as e:
+                logger.error(f"✗ Test cases migration failed: {e}", exc_info=True)
+                case_mapping = {}
+                mappings.save_to_file(args.mappings_file)
+            
+            logger.info(f"\nMigrating test runs for {project_code_source}...")
+            try:
+                run_mapping = migrate_runs(
+                    source_service, target_service,
+                    project_code_source, project_code_target,
+                    case_mapping,
+                    config_mapping,
+                    milestone_mapping,
+                    user_mapping,
+                    mappings,
+                    stats
+                )
+                mappings.save_to_file(args.mappings_file)
+            except Exception as e:
+                logger.error(f"✗ Test runs migration failed: {e}", exc_info=True)
+                run_mapping = {}
+                mappings.save_to_file(args.mappings_file)
+            
+            logger.info(f"\nMigrating test results for {project_code_source}...")
+            try:
+                migrate_results(
+                    source_service, target_service,
+                    project_code_source, project_code_target,
+                    run_mapping,
+                    case_mapping,
+                    mappings,
+                    stats
+                )
+                mappings.save_to_file(args.mappings_file)
+            except Exception as e:
+                logger.error(f"✗ Test results migration failed: {e}", exc_info=True)
+                mappings.save_to_file(args.mappings_file)
+            
+            logger.info(f"\nCompleted migration for project {project_code_source}")
+            logger.info(f"Summary for {project_code_source}:")
+            project_stats = {}
+            for entity_type in ['milestones', 'configurations', 'shared_steps', 'suites', 'cases', 'runs', 'results']:
+                if hasattr(stats, 'entities_created') and entity_type in stats.entities_created:
+                    created = stats.entities_created.get(entity_type, 0)
+                    processed = stats.entities_processed.get(entity_type, 0)
+                    project_stats[entity_type] = f"{created}/{processed}"
+            for entity_type, count in project_stats.items():
+                logger.info(f"  {entity_type}: {count}")
+        
+        stats.print_summary()
+        
+        mappings.save_to_file(args.mappings_file)
+        logger.info(f"\nMigration complete! Mappings saved to {args.mappings_file}")
+        
+    except KeyboardInterrupt:
+        logger.warning("\nMigration interrupted by user")
+        mappings.save_to_file(args.mappings_file)
+        logger.info(f"Mappings saved to {args.mappings_file}. Use --resume to continue.")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"\nMigration failed with error: {e}", exc_info=True)
+        mappings.save_to_file(args.mappings_file)
+        logger.info(f"Mappings saved to {args.mappings_file}. Use --resume to continue.")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

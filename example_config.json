@@ -1,0 +1,20 @@
+{
+  "source": {
+    "api_token": "YOUR_SOURCE_API_TOKEN",
+    "host": "qase.io",
+    "enterprise": false,
+    "ssl": true
+  },
+  "target": {
+    "api_token": "YOUR_TARGET_API_TOKEN",
+    "host": "qase.io",
+    "enterprise": false,
+    "ssl": true
+  },
+  "options": {
+    "preserve_ids": true,
+    "mappings_file": "mappings.json",
+    "skip_projects": [],
+    "only_projects": ["ECSE", "DIS", "TDS"]
+  }
+}

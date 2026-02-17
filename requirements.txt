@@ -1,0 +1,10 @@
+certifi
+requests
+urllib3>=2.2.3
+mysql-connector-python
+psutil
+pandas
+openpyxl
+beautifulsoup4
+qase-api-client>=2.0.1
+qase-api-v2-client>=2.0.0

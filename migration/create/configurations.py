@@ -1,0 +1,104 @@
+"""
+Create configurations in target Qase workspace.
+"""
+import logging
+from typing import Dict, Any, List, Tuple
+from qase.api_client_v1.api.configurations_api import ConfigurationsApi
+from qase.api_client_v1.models import ConfigurationGroupCreate, ConfigurationCreate
+from qase_service import QaseService
+from migration.utils import MigrationMappings, MigrationStats, retry_with_backoff, to_dict
+
+logger = logging.getLogger(__name__)
+
+
+def migrate_configurations(
+    source_service: QaseService,
+    target_service: QaseService,
+    project_code_source: str,
+    project_code_target: str,
+    mappings: MigrationMappings,
+    stats: MigrationStats
+) -> Tuple[Dict[int, int], Dict[int, int]]:
+    """
+    Migrate configurations from source to target workspace.
+    
+    Args:
+        source_service: Source Qase service
+        target_service: Target Qase service
+        project_code_source: Source project code
+        project_code_target: Target project code
+        mappings: Migration mappings object
+        stats: Migration stats object
+    
+    Returns:
+        Tuple of (configuration_group_mapping, configuration_mapping)
+    """
+    from migration.extract.configurations import extract_configurations
+    
+    groups_list = extract_configurations(source_service, project_code_source)
+    
+    configs_api_target = ConfigurationsApi(target_service.client)
+    group_mapping = {}
+    config_mapping = {}
+    
+    for group_dict in groups_list:
+        group_data = ConfigurationGroupCreate(title=group_dict['title'])
+        
+        create_response = retry_with_backoff(
+            configs_api_target.create_configuration_group,
+            code=project_code_target,
+            configuration_group_create=group_data
+        )
+        
+        if create_response:
+            target_group_id = None
+            if hasattr(create_response, 'status') and hasattr(create_response, 'result'):
+                if create_response.status and create_response.result:
+                    target_group_id = getattr(create_response.result, 'id', None)
+            elif hasattr(create_response, 'id'):
+                target_group_id = create_response.id
+            elif hasattr(create_response, 'result'):
+                result = create_response.result
+                target_group_id = getattr(result, 'id', None)
+            
+            if target_group_id:
+                group_mapping[group_dict.get('id')] = target_group_id
+                
+                if 'configs' in group_dict:
+                    for config in group_dict['configs']:
+                        config_dict = to_dict(config)
+                        config_data = ConfigurationCreate(
+                            title=config_dict['title'],
+                            group_id=target_group_id
+                        )
+                        
+                        config_create_response = retry_with_backoff(
+                            configs_api_target.create_configuration,
+                            code=project_code_target,
+                            configuration_create=config_data
+                        )
+                        
+                        if config_create_response:
+                            target_config_id = None
+                            if hasattr(config_create_response, 'status') and hasattr(config_create_response, 'result'):
+                                if config_create_response.status and config_create_response.result:
+                                    target_config_id = getattr(config_create_response.result, 'id', None)
+                            elif hasattr(config_create_response, 'id'):
+                                target_config_id = config_create_response.id
+                            elif hasattr(config_create_response, 'result'):
+                                result = config_create_response.result
+                                target_config_id = getattr(result, 'id', None)
+                            
+                            if target_config_id:
+                                config_mapping[config_dict.get('id')] = target_config_id
+    
+    if project_code_source not in mappings.configuration_groups:
+        mappings.configuration_groups[project_code_source] = {}
+    mappings.configuration_groups[project_code_source].update(group_mapping)
+    
+    if project_code_source not in mappings.configurations:
+        mappings.configurations[project_code_source] = {}
+    mappings.configurations[project_code_source].update(config_mapping)
+    
+    stats.add_entity('configurations', len(groups_list), len(config_mapping))
+    return group_mapping, config_mapping
