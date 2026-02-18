@@ -26,6 +26,7 @@ from migration.create import (
     migrate_shared_steps,
     migrate_suites,
     migrate_cases,
+    migrate_plans,
     migrate_runs,
     migrate_results
 )
@@ -327,6 +328,21 @@ def main():
                 case_mapping = {}
                 mappings.save_to_file(args.mappings_file)
             
+            logger.info(f"\nMigrating test plans for {project_code_source}...")
+            try:
+                plan_mapping = migrate_plans(
+                    source_service, target_service,
+                    project_code_source, project_code_target,
+                    case_mapping,
+                    mappings,
+                    stats
+                )
+                mappings.save_to_file(args.mappings_file)
+            except Exception as e:
+                logger.error(f"✗ Test plans migration failed: {e}", exc_info=True)
+                plan_mapping = {}
+                mappings.save_to_file(args.mappings_file)
+            
             logger.info(f"\nMigrating test runs for {project_code_source}...")
             try:
                 run_mapping = migrate_runs(
@@ -335,6 +351,7 @@ def main():
                     case_mapping,
                     config_mapping,
                     milestone_mapping,
+                    plan_mapping,
                     user_mapping,
                     mappings,
                     stats
@@ -363,7 +380,7 @@ def main():
             logger.info(f"\nCompleted migration for project {project_code_source}")
             logger.info(f"Summary for {project_code_source}:")
             project_stats = {}
-            for entity_type in ['milestones', 'configurations', 'shared_steps', 'suites', 'cases', 'runs', 'results']:
+            for entity_type in ['milestones', 'configurations', 'shared_steps', 'suites', 'cases', 'plans', 'runs', 'results']:
                 if hasattr(stats, 'entities_created') and entity_type in stats.entities_created:
                     created = stats.entities_created.get(entity_type, 0)
                     processed = stats.entities_processed.get(entity_type, 0)

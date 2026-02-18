@@ -20,6 +20,7 @@ def migrate_runs(
     case_mapping: Dict[int, int],
     config_mapping: Dict[int, int],
     milestone_mapping: Dict[int, int],
+    plan_mapping: Dict[int, int],
     user_mapping: Dict[int, int],
     mappings: MigrationMappings,
     stats: MigrationStats
@@ -94,6 +95,10 @@ def migrate_runs(
             mapped_milestone = milestone_mapping.get(run_dict.get('milestone_id'))
             if mapped_milestone:
                 run_data_dict['milestone_id'] = mapped_milestone
+        if run_dict.get('plan_id'):
+            mapped_plan = plan_mapping.get(run_dict.get('plan_id'))
+            if mapped_plan:
+                run_data_dict['plan_id'] = mapped_plan
         
         run_data = RunCreate(**run_data_dict)
         

@@ -36,6 +36,7 @@ class MigrationMappings:
         self.custom_fields = {}
         self.users = {}
         self.attachments = {}
+        self.plans = {}
         self.target_workspace_hash = None
     
     def save_to_file(self, filepath: str):
@@ -53,7 +54,8 @@ class MigrationMappings:
             'shared_parameters': self.shared_parameters,
             'custom_fields': self.custom_fields,
             'users': self.users,
-            'attachments': self.attachments
+            'attachments': self.attachments,
+            'plans': self.plans
         }
         with open(filepath, 'w') as f:
             json.dump(mappings_dict, f, indent=2)
@@ -76,6 +78,7 @@ class MigrationMappings:
             self.custom_fields = mappings_dict.get('custom_fields', {})
             self.users = mappings_dict.get('users', {})
             self.attachments = mappings_dict.get('attachments', {})
+            self.plans = mappings_dict.get('plans', {})
             self.target_workspace_hash = mappings_dict.get('target_workspace_hash')
         except FileNotFoundError:
             pass
