@@ -30,6 +30,7 @@ class MigrationMappings:
         self.milestones = {}
         self.configurations = {}
         self.configuration_groups = {}
+        self.environments = {}
         self.shared_steps = {}
         self.shared_parameters = {}
         self.custom_fields = {}
@@ -47,6 +48,7 @@ class MigrationMappings:
             'milestones': self.milestones,
             'configurations': self.configurations,
             'configuration_groups': self.configuration_groups,
+            'environments': self.environments,
             'shared_steps': self.shared_steps,
             'shared_parameters': self.shared_parameters,
             'custom_fields': self.custom_fields,
@@ -68,6 +70,7 @@ class MigrationMappings:
             self.milestones = mappings_dict.get('milestones', {})
             self.configurations = mappings_dict.get('configurations', {})
             self.configuration_groups = mappings_dict.get('configuration_groups', {})
+            self.environments = mappings_dict.get('environments', {})
             self.shared_steps = mappings_dict.get('shared_steps', {})
             self.shared_parameters = mappings_dict.get('shared_parameters', {})
             self.custom_fields = mappings_dict.get('custom_fields', {})

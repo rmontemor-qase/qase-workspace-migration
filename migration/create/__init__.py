@@ -7,6 +7,7 @@ from migration.create.custom_fields import migrate_custom_fields
 from migration.create.shared_parameters import migrate_shared_parameters
 from migration.create.milestones import migrate_milestones
 from migration.create.configurations import migrate_configurations
+from migration.create.environments import migrate_environments
 from migration.create.shared_steps import migrate_shared_steps
 from migration.create.suites import migrate_suites
 from migration.create.cases import migrate_cases
@@ -21,6 +22,7 @@ __all__ = [
     'migrate_shared_parameters',
     'migrate_milestones',
     'migrate_configurations',
+    'migrate_environments',
     'migrate_shared_steps',
     'migrate_suites',
     'migrate_cases',

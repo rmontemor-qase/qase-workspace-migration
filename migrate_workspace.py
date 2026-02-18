@@ -22,6 +22,7 @@ from migration.create import (
     migrate_attachments_workspace,
     migrate_milestones,
     migrate_configurations,
+    migrate_environments,
     migrate_shared_steps,
     migrate_suites,
     migrate_cases,
@@ -264,6 +265,19 @@ def main():
                 logger.error(f"✗ Configurations migration failed: {e}", exc_info=True)
                 config_group_mapping = {}
                 config_mapping = {}
+                mappings.save_to_file(args.mappings_file)
+            
+            logger.info(f"\nMigrating environments for {project_code_source}...")
+            try:
+                environment_mapping = migrate_environments(
+                    source_service, target_service,
+                    project_code_source, project_code_target,
+                    mappings, stats
+                )
+                mappings.save_to_file(args.mappings_file)
+            except Exception as e:
+                logger.error(f"✗ Environments migration failed: {e}", exc_info=True)
+                environment_mapping = {}
                 mappings.save_to_file(args.mappings_file)
             
             logger.info(f"\nMigrating shared steps for {project_code_source}...")
