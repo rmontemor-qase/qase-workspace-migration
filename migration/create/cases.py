@@ -23,6 +23,7 @@ def transform_case_data(
     custom_field_mapping: Dict[int, int],
     milestone_mapping: Dict[int, int],
     shared_step_mapping: Dict[str, str],
+    shared_parameter_mapping: Dict[str, str],
     user_mapping: Dict[int, int],
     attachment_mapping: Dict[str, str],
     mappings: MigrationMappings,
@@ -88,10 +89,96 @@ def transform_case_data(
         'author_id': user_mapping.get(case_dict.get('author_id'), 1),
         'milestone_id': milestone_mapping.get(case_dict.get('milestone_id')) if case_dict.get('milestone_id') else None,
         'attachments': [],  # Will be mapped below
-        'params': {},  # Must be a dict, not a list
         'is_flaky': case_dict.get('is_flaky', 0),
         'custom_field': {}
     }
+    
+    # Extract and process params
+    # Qase SDK expects params as dict format: {"Browser": ["Chrome"], "User1": ["Password"]}
+    source_params = case_dict.get('params')
+    source_parameters = case_dict.get('parameters')
+    
+    # Check if case has parameters structure (need raw HTTP API to preserve structure)
+    has_parameters_structure = False
+    has_group_parameters = False
+    if source_parameters and isinstance(source_parameters, list):
+        has_parameters_structure = True
+        has_group_parameters = any(
+            isinstance(p, dict) and p.get('type') == 'group'
+            for p in source_parameters
+        )
+    
+    if source_params and isinstance(source_params, dict) and len(source_params) > 0:
+        case_data['params'] = source_params
+    else:
+        # Empty params must be empty dict for SDK validation
+        case_data['params'] = {}
+    
+    # Preserve parameters structure for cases with parameters field (will use raw HTTP API)
+    # This preserves both single and group parameters in their proper structure
+    if has_parameters_structure and source_parameters:
+        parameters_list = []
+        for param_item in source_parameters:
+            param_dict = to_dict(param_item) if not isinstance(param_item, dict) else param_item
+            if isinstance(param_dict, dict):
+                param_type = param_dict.get('type')
+                source_shared_id = param_dict.get('shared_id')
+                
+                # Map shared parameter ID if it exists
+                target_shared_id = None
+                if source_shared_id:
+                    # Convert to string for consistent lookup
+                    source_shared_id_str = str(source_shared_id)
+                    if source_shared_id_str in shared_parameter_mapping:
+                        target_shared_id = shared_parameter_mapping[source_shared_id_str]
+                    # Also try original format
+                    elif source_shared_id in shared_parameter_mapping:
+                        target_shared_id = shared_parameter_mapping[source_shared_id]
+                
+                # If this is a shared parameter reference, use simplified format: {"shared_id": "..."}
+                if target_shared_id:
+                    parameters_list.append({
+                        'shared_id': str(target_shared_id)
+                    })
+                    continue
+                
+                # Handle single type parameter (non-shared)
+                # API format: {"title": "...", "values": [...]}
+                if param_type == 'single' and 'item' in param_dict:
+                    item = param_dict['item']
+                    item_dict = to_dict(item) if not isinstance(item, dict) else item
+                    if isinstance(item_dict, dict):
+                        param_name = item_dict.get('title') or item_dict.get('name')
+                        param_values = item_dict.get('values') or []
+                        if param_name and param_values:
+                            parameters_list.append({
+                                'title': param_name,
+                                'values': param_values if isinstance(param_values, list) else [param_values]
+                            })
+                # Handle group type parameter - preserve as group (non-shared)
+                # API format: {"items": [{"title": "...", "values": [...]}, ...]}
+                elif param_type == 'group' and 'items' in param_dict:
+                    items = param_dict['items']
+                    if isinstance(items, list):
+                        group_items = []
+                        for item in items:
+                            item_dict = to_dict(item) if not isinstance(item, dict) else item
+                            if isinstance(item_dict, dict):
+                                param_name = item_dict.get('title') or item_dict.get('name')
+                                param_values = item_dict.get('values') or []
+                                if param_name and param_values:
+                                    group_items.append({
+                                        'title': param_name,
+                                        'values': param_values if isinstance(param_values, list) else [param_values]
+                                    })
+                        if group_items:
+                            parameters_list.append({
+                                'items': group_items
+                            })
+        
+        if parameters_list:
+            case_data['parameters'] = parameters_list
+            case_data['_has_parameters_structure'] = True
     
     if case_id:
         case_data['id'] = case_id
@@ -225,6 +312,7 @@ def migrate_cases(
     custom_field_mapping: Dict[int, int],
     milestone_mapping: Dict[int, int],
     shared_step_mapping: Dict[str, str],
+    shared_parameter_mapping: Dict[str, str],
     user_mapping: Dict[int, int],
     mappings: MigrationMappings,
     stats: MigrationStats,
@@ -257,6 +345,15 @@ def migrate_cases(
             normalized_mapping[key] = value
         attachment_mapping = normalized_mapping
     
+    # Use workspace-level shared parameter mapping from mappings
+    if hasattr(mappings, 'shared_parameters') and mappings.shared_parameters:
+        # Merge with any passed mapping (workspace-level takes precedence)
+        if shared_parameter_mapping:
+            mappings.shared_parameters.update(shared_parameter_mapping)
+        shared_parameter_mapping = mappings.shared_parameters
+    elif not shared_parameter_mapping:
+        shared_parameter_mapping = {}
+    
     all_source_cases = extract_cases(source_service, project_code_source, limit)
     
     if not all_source_cases:
@@ -272,13 +369,13 @@ def migrate_cases(
         batch_cases = all_source_cases[batch_start:batch_start + batch_size]
         
         cases_to_create = []
-        cases_with_shared_steps = []
+        cases_with_shared_steps = []  # Also includes cases with group parameters
         
         for case_dict in batch_cases:
             case_data = transform_case_data(
                 case_dict, suite_mapping, custom_field_mapping,
-                milestone_mapping, shared_step_mapping, user_mapping,
-                attachment_mapping, mappings, preserve_ids
+                milestone_mapping, shared_step_mapping, shared_parameter_mapping,
+                user_mapping, attachment_mapping, mappings, preserve_ids
             )
             
             if not case_data:
@@ -289,8 +386,9 @@ def migrate_cases(
                 isinstance(step, dict) and 'shared' in step
                 for step in case_data.get('steps', [])
             )
+            has_parameters_structure = case_data.pop('_has_parameters_structure', False)
             
-            if has_shared_steps:
+            if has_shared_steps or has_parameters_structure:
                 case_data['_source_id'] = source_id
                 cases_with_shared_steps.append(case_data)
             else:

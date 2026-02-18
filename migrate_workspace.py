@@ -18,6 +18,7 @@ from migration.create import (
     migrate_projects,
     migrate_users,
     migrate_custom_fields,
+    migrate_shared_parameters,
     migrate_attachments_workspace,
     migrate_milestones,
     migrate_configurations,
@@ -212,7 +213,17 @@ def main():
         mappings.save_to_file(args.mappings_file)
         
         logger.info("\n" + "="*60)
-        logger.info("STEP 4: Migrating Attachments (Workspace Level)")
+        logger.info("STEP 4: Migrating Shared Parameters (Workspace Level)")
+        logger.info("="*60)
+        project_codes_list = [p['source_code'] for p in projects]
+        shared_parameter_mapping = migrate_shared_parameters(
+            source_service, target_service,
+            project_codes_list, mappings, stats
+        )
+        mappings.save_to_file(args.mappings_file)
+        
+        logger.info("\n" + "="*60)
+        logger.info("STEP 5: Migrating Attachments (Workspace Level)")
         logger.info("="*60)
         attachment_mapping = migrate_attachments_workspace(
             source_service, target_service,
@@ -290,6 +301,7 @@ def main():
                     custom_field_mapping,
                     milestone_mapping,
                     shared_step_mapping,
+                    shared_parameter_mapping,
                     user_mapping,
                     mappings,
                     stats,

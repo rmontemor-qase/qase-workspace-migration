@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import hashlib
+import uuid
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 from qase.api_client_v1.exceptions import ApiException
@@ -30,6 +31,7 @@ class MigrationMappings:
         self.configurations = {}
         self.configuration_groups = {}
         self.shared_steps = {}
+        self.shared_parameters = {}
         self.custom_fields = {}
         self.users = {}
         self.attachments = {}
@@ -46,6 +48,7 @@ class MigrationMappings:
             'configurations': self.configurations,
             'configuration_groups': self.configuration_groups,
             'shared_steps': self.shared_steps,
+            'shared_parameters': self.shared_parameters,
             'custom_fields': self.custom_fields,
             'users': self.users,
             'attachments': self.attachments
@@ -66,6 +69,7 @@ class MigrationMappings:
             self.configurations = mappings_dict.get('configurations', {})
             self.configuration_groups = mappings_dict.get('configuration_groups', {})
             self.shared_steps = mappings_dict.get('shared_steps', {})
+            self.shared_parameters = mappings_dict.get('shared_parameters', {})
             self.custom_fields = mappings_dict.get('custom_fields', {})
             self.users = mappings_dict.get('users', {})
             self.attachments = mappings_dict.get('attachments', {})
@@ -367,6 +371,26 @@ def extract_entities_from_response(response: Any) -> Optional[List]:
     return entities if entities else None
 
 
+def convert_uuids_to_strings(obj: Any) -> Any:
+    """
+    Recursively convert UUID objects to strings for JSON serialization.
+    
+    Args:
+        obj: Object that may contain UUIDs
+    
+    Returns:
+        Object with UUIDs converted to strings
+    """
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {key: convert_uuids_to_strings(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_uuids_to_strings(item) for item in obj]
+    else:
+        return obj
+
+
 class QaseRawApiClient:
     """Raw HTTP API client for operations that SDK doesn't support well."""
     
@@ -397,7 +421,9 @@ class QaseRawApiClient:
             List of created case IDs if successful, None otherwise
         """
         url = f"{self.base_url}/case/{project_code}/bulk"
-        payload = {"cases": cases}
+        # Convert UUIDs to strings before JSON serialization
+        cases_serializable = convert_uuids_to_strings(cases)
+        payload = {"cases": cases_serializable}
         
         try:
             response = requests.post(url, headers=self.headers, json=payload, timeout=60)

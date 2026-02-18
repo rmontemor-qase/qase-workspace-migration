@@ -4,6 +4,7 @@ Creation module - functions to create entities in target Qase workspace.
 from migration.create.projects import migrate_projects
 from migration.create.users import migrate_users
 from migration.create.custom_fields import migrate_custom_fields
+from migration.create.shared_parameters import migrate_shared_parameters
 from migration.create.milestones import migrate_milestones
 from migration.create.configurations import migrate_configurations
 from migration.create.shared_steps import migrate_shared_steps
@@ -17,6 +18,7 @@ __all__ = [
     'migrate_projects',
     'migrate_users',
     'migrate_custom_fields',
+    'migrate_shared_parameters',
     'migrate_milestones',
     'migrate_configurations',
     'migrate_shared_steps',
