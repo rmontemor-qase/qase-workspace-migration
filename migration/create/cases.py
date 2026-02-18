@@ -158,12 +158,32 @@ def transform_case_data(
         processed_steps = []
         for step in case_dict['steps']:
             step_dict = to_dict(step)
-            if isinstance(step_dict, dict) and 'shared' in step_dict:
-                source_hash = step_dict['shared']
+            
+            # Check for shared step reference in various formats
+            source_hash = None
+            if isinstance(step_dict, dict):
+                # Format 1: {"shared": "hash"}
+                if 'shared' in step_dict:
+                    source_hash = step_dict['shared']
+                # Format 2: {"shared_step": {"hash": "..."}}
+                elif 'shared_step' in step_dict:
+                    shared_step_obj = step_dict['shared_step']
+                    if isinstance(shared_step_obj, dict):
+                        source_hash = shared_step_obj.get('hash')
+                    elif hasattr(shared_step_obj, 'hash'):
+                        source_hash = getattr(shared_step_obj, 'hash', None)
+                # Format 3: Check if step has a shared_step_hash field
+                elif 'shared_step_hash' in step_dict:
+                    source_hash = step_dict['shared_step_hash']
+            
+            if source_hash:
                 target_hash = shared_step_mapping.get(source_hash)
                 if target_hash:
                     processed_steps.append({'shared': target_hash})
-            else:
+                continue
+            
+            # Regular step processing
+            if isinstance(step_dict, dict):
                 step_attachments = step_dict.get('attachments', []) or []
                 mapped_step_attachments = []
                 if step_attachments and attachment_mapping:
@@ -306,19 +326,9 @@ def migrate_cases(
         if cases_with_shared_steps:
             for case_data in cases_with_shared_steps:
                 source_id = case_data.pop('_source_id')
-                success = raw_api_client.create_cases_bulk(project_code_target, [case_data])
-                if success:
-                    try:
-                        created_cases_response = cases_api_target.get_cases(
-                            code=project_code_target,
-                            filters={'title': case_data['title']},
-                            limit=1
-                        )
-                        created_cases_entities = extract_entities_from_response(created_cases_response)
-                        if created_cases_entities:
-                            case_mapping[source_id] = created_cases_entities[0].id
-                    except:
-                        pass
+                created_ids = raw_api_client.create_cases_bulk(project_code_target, [case_data])
+                if created_ids and len(created_ids) > 0:
+                    case_mapping[source_id] = created_ids[0]
     
     if project_code_source not in mappings.cases:
         mappings.cases[project_code_source] = {}

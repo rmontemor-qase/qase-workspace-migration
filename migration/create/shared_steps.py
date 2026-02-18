@@ -48,10 +48,14 @@ def migrate_shared_steps(
         processed_steps = []
         for step_item in step_dict.get('steps', []):
             step_item_dict = to_dict(step_item)
+            action = step_item_dict.get('action', '').strip()
+            if not action:
+                action = 'No action'
+            
             processed_steps.append(
                 SharedStepContentCreate(
-                    action=step_item_dict.get('action', ''),
-                    expected_result=step_item_dict.get('expected_result')
+                    action=action,
+                    expected_result=step_item_dict.get('expected_result') or step_item_dict.get('expected')
                 )
             )
         

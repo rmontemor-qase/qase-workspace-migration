@@ -384,7 +384,7 @@ class QaseRawApiClient:
             'Content-Type': 'application/json'
         }
     
-    def create_cases_bulk(self, project_code: str, cases: List[Dict[str, Any]]) -> bool:
+    def create_cases_bulk(self, project_code: str, cases: List[Dict[str, Any]]) -> Optional[List[int]]:
         """
         Create test cases in bulk using raw HTTP API.
         This bypasses SDK validation which may reject cases with shared steps.
@@ -394,7 +394,7 @@ class QaseRawApiClient:
             cases: List of case dictionaries
         
         Returns:
-            True if successful, False otherwise
+            List of created case IDs if successful, None otherwise
         """
         url = f"{self.base_url}/case/{project_code}/bulk"
         payload = {"cases": cases}
@@ -402,13 +402,19 @@ class QaseRawApiClient:
         try:
             response = requests.post(url, headers=self.headers, json=payload, timeout=60)
             if response.status_code == 200:
-                return True
+                response_data = response.json()
+                if 'result' in response_data:
+                    if 'ids' in response_data['result']:
+                        return response_data['result']['ids']
+                    elif 'id' in response_data['result']:
+                        return [response_data['result']['id']]
+                return []
             else:
                 logger.error(f"Failed to create cases bulk: {response.status_code} - {response.text}")
-                return False
+                return None
         except Exception as e:
             logger.error(f"Exception creating cases bulk: {e}")
-            return False
+            return None
     
     def attach_external_issues(self, project_code: str, links: List[Dict[str, Any]], issue_type: str = "jira-cloud") -> bool:
         """
