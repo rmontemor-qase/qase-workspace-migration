@@ -62,13 +62,34 @@ def migrate_configurations(
                 target_group_id = getattr(result, 'id', None)
             
             if target_group_id:
-                group_mapping[group_dict.get('id')] = target_group_id
+                source_group_id = group_dict.get('id')
+                group_mapping[source_group_id] = target_group_id
                 
+                # Check for configurations in various possible field names
+                configs_list = None
                 if 'configs' in group_dict:
-                    for config in group_dict['configs']:
-                        config_dict = to_dict(config)
+                    configs_list = group_dict['configs']
+                elif 'configurations' in group_dict:
+                    configs_list = group_dict['configurations']
+                elif 'entities' in group_dict:
+                    configs_list = group_dict['entities']
+                
+                if configs_list:
+                    for config in configs_list:
+                        config_dict = to_dict(config) if not isinstance(config, dict) else config
+                        config_title = config_dict.get('title')
+                        source_config_id = config_dict.get('id')
+                        
+                        if not config_title:
+                            continue
+                        
+                        # Skip if already mapped
+                        if project_code_source in mappings.configurations and source_config_id in mappings.configurations[project_code_source]:
+                            config_mapping[source_config_id] = mappings.configurations[project_code_source][source_config_id]
+                            continue
+                        
                         config_data = ConfigurationCreate(
-                            title=config_dict['title'],
+                            title=config_title,
                             group_id=target_group_id
                         )
                         
@@ -90,7 +111,7 @@ def migrate_configurations(
                                 target_config_id = getattr(result, 'id', None)
                             
                             if target_config_id:
-                                config_mapping[config_dict.get('id')] = target_config_id
+                                config_mapping[source_config_id] = target_config_id
     
     if project_code_source not in mappings.configuration_groups:
         mappings.configuration_groups[project_code_source] = {}
@@ -100,5 +121,16 @@ def migrate_configurations(
         mappings.configurations[project_code_source] = {}
     mappings.configurations[project_code_source].update(config_mapping)
     
-    stats.add_entity('configurations', len(groups_list), len(config_mapping))
+    # Count total configurations for stats
+    total_configs = 0
+    for group_dict in groups_list:
+        if 'configs' in group_dict:
+            total_configs += len(group_dict['configs'])
+        elif 'configurations' in group_dict:
+            total_configs += len(group_dict['configurations'])
+        elif 'entities' in group_dict:
+            total_configs += len(group_dict['entities'])
+    
+    stats.add_entity('configuration_groups', len(groups_list), len(group_mapping))
+    stats.add_entity('configurations', total_configs, len(config_mapping))
     return group_mapping, config_mapping
