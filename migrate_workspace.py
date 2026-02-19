@@ -438,8 +438,7 @@ def main():
                     run_mapping,
                     case_mapping,
                     mappings,
-                    stats,
-                    user_mapping
+                    stats
                 )
                 mappings.save_to_file(args.mappings_file)
             except Exception as e:

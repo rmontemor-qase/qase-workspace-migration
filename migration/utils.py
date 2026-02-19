@@ -37,6 +37,7 @@ class MigrationMappings:
         self.users = {}
         self.user_email_mapping = {}  # email -> target_user_id mapping
         self.user_uuid_mapping = {}  # source_user_uuid -> target_user_id mapping
+        self.author_uuid_to_id_mapping = {}  # source_author_uuid -> source_author_id mapping
         self.attachments = {}
         self.plans = {}
         self.target_workspace_hash = None
@@ -58,6 +59,7 @@ class MigrationMappings:
             'users': self.users,
             'user_email_mapping': getattr(self, 'user_email_mapping', {}),
             'user_uuid_mapping': getattr(self, 'user_uuid_mapping', {}),
+            'author_uuid_to_id_mapping': getattr(self, 'author_uuid_to_id_mapping', {}),
             'attachments': self.attachments,
             'plans': self.plans
         }
@@ -104,6 +106,7 @@ class MigrationMappings:
             self.users = {int(k): v for k, v in users_dict.items() if k} if users_dict else {}
             self.user_email_mapping = mappings_dict.get('user_email_mapping', {})
             self.user_uuid_mapping = mappings_dict.get('user_uuid_mapping', {})
+            self.author_uuid_to_id_mapping = mappings_dict.get('author_uuid_to_id_mapping', {})
             self.attachments = mappings_dict.get('attachments', {})
             self.plans = mappings_dict.get('plans', {})
             self.target_workspace_hash = mappings_dict.get('target_workspace_hash')
@@ -512,6 +515,32 @@ class QaseRawApiClient:
         except Exception as e:
             logger.error(f"Exception creating cases bulk: {e}")
             return None
+    
+    def create_results_bulk(self, project_code: str, run_id: int, results: List[Dict[str, Any]]) -> bool:
+        """
+        Create test results in bulk using raw HTTP API.
+        
+        Args:
+            project_code: Project code
+            run_id: Run ID
+            results: List of result dictionaries with case_id, status, author_id, etc.
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        url = f"{self.base_url}/result/{project_code}/{run_id}/bulk"
+        payload = {"results": results}
+        
+        try:
+            response = requests.post(url, headers=self.headers, json=payload, timeout=60)
+            if response.status_code == 200:
+                return True
+            else:
+                logger.error(f"Failed to create results bulk: {response.status_code} - {response.text}")
+                return False
+        except Exception as e:
+            logger.error(f"Exception creating results bulk: {e}")
+            return False
     
     def attach_external_issues(self, project_code: str, links: List[Dict[str, Any]], issue_type: str = "jira-cloud") -> bool:
         """

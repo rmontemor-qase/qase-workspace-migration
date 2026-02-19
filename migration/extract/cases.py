@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 def extract_cases(source_service: QaseService, project_code: str, limit: int = 100) -> List[Dict[str, Any]]:
     """
     Extract test cases from source project.
-    Fetches full case details including steps with shared step references.
+    Uses bulk extraction via get_cases() which returns full case details including steps.
     
     Args:
         source_service: Source Qase service
@@ -21,15 +21,14 @@ def extract_cases(source_service: QaseService, project_code: str, limit: int = 1
         limit: Batch size (default 100, or 20 for enterprise)
     
     Returns:
-        List of case dictionaries with full step details
+        List of case dictionaries with full details including steps and member_id
     """
     cases_api_source = CasesApi(source_service.client)
     
     cases = []
     offset = 0
     
-    # First, get list of case IDs
-    case_ids = []
+    # Use bulk extraction - get_cases() returns full case details
     while True:
         source_cases_response = retry_with_backoff(
             cases_api_source.get_cases,
@@ -42,29 +41,33 @@ def extract_cases(source_service: QaseService, project_code: str, limit: int = 1
         if not source_cases_entities:
             break
         
+        # Convert entities to dictionaries - get_cases() should return full details
         for source_case in source_cases_entities:
             case_dict = to_dict(source_case)
-            case_id = case_dict.get('id')
-            if case_id:
-                case_ids.append(case_id)
+            # Check if we have steps (full details) or need to fetch individually
+            if case_dict.get('steps') is not None or case_dict.get('steps_type') is not None:
+                # Full details available, use directly
+                cases.append(case_dict)
+            else:
+                # Need to fetch full details for steps/shared steps
+                case_id = case_dict.get('id')
+                if case_id:
+                    try:
+                        case_response = retry_with_backoff(
+                            cases_api_source.get_case,
+                            code=project_code,
+                            id=case_id
+                        )
+                        
+                        if case_response and hasattr(case_response, 'result') and case_response.result:
+                            full_case_dict = to_dict(case_response.result)
+                            cases.append(full_case_dict)
+                    except Exception:
+                        # If individual fetch fails, use summary data
+                        cases.append(case_dict)
         
         if len(source_cases_entities) < limit:
             break
         offset += limit
-    
-    # Fetch full details for each case to preserve shared step references
-    for case_id in case_ids:
-        try:
-            case_response = retry_with_backoff(
-                cases_api_source.get_case,
-                code=project_code,
-                id=case_id
-            )
-            
-            if case_response and hasattr(case_response, 'result') and case_response.result:
-                case_dict = to_dict(case_response.result)
-                cases.append(case_dict)
-        except Exception:
-            continue
     
     return cases

@@ -3,48 +3,15 @@ Create cases in target Qase workspace.
 """
 import logging
 import re
-from typing import Dict, Any, List, Optional
-from qase.api_client_v1.api.cases_api import CasesApi
-from qase.api_client_v1.models import TestCasebulk, TestCasebulkCasesInner
+from typing import Dict, Any, Optional
 from qase_service import QaseService
 from migration.utils import (
-    MigrationMappings, MigrationStats, retry_with_backoff,
-    extract_entities_from_response, to_dict, preserve_or_hash_id,
+    MigrationMappings, MigrationStats, to_dict, preserve_or_hash_id,
     QaseRawApiClient
 )
 from migration.transform.attachments import replace_attachment_hashes_in_text
 
 logger = logging.getLogger(__name__)
-
-
-def _get_target_user_id(source_user_id: Any, user_mapping: Dict[int, int], default_user_id: int = 1) -> int:
-    """
-    Get target user ID from source user ID using user_mapping.
-    
-    Following QASE_AUTHOR_ID_BREAKDOWN.md pattern:
-    - Maps source workspace user ID to target workspace user ID
-    - Falls back to default_user_id if mapping not found
-    
-    The user_mapping is already built based on email matching:
-    - Source users are matched to target users by email (case-insensitive)
-    - Mapping is: source_id -> target_id
-    
-    Args:
-        source_user_id: Source user ID (from created_by or author_id field)
-        user_mapping: Dictionary mapping source_id -> target_id (built via email matching)
-        default_user_id: Fallback user ID if mapping not found (default: 1)
-    
-    Returns:
-        Target user ID or default_user_id
-    """
-    if not source_user_id:
-        return default_user_id
-    
-    try:
-        source_user_id_int = int(source_user_id)
-        return user_mapping.get(source_user_id_int, default_user_id)
-    except (ValueError, TypeError):
-        return default_user_id
 
 
 def transform_case_data(
@@ -102,29 +69,18 @@ def transform_case_data(
     else:
         updated_at = None
     
-    # Map author_id: Qase API returns 'author_uuid' field in case data
-    # Use UUID mapping first (most reliable), then fallback to member_id/created_by/author_id
-    target_author_id = 1  # Default
-    author_uuid = case_dict.get('author_uuid')
-    
-    if author_uuid:
-        # Try UUID mapping first (author_uuid -> target_user_id)
-        user_uuid_mapping = getattr(mappings, 'user_uuid_mapping', {})
-        target_author_id = user_uuid_mapping.get(str(author_uuid), 1)
-    else:
-        # Fallback to member_id/created_by/author_id if UUID not available
-        source_user_id = case_dict.get('member_id') or case_dict.get('created_by') or case_dict.get('author_id')
-        if source_user_id:
-            try:
-                source_user_id_int = int(source_user_id)
-                # Skip if user_id is 0 (system/automated cases)
-                if source_user_id_int == 0:
-                    target_author_id = 1  # Default user for automated cases
-                else:
-                    # Use mappings.get_user_id() method (per document pattern)
-                    target_author_id = mappings.get_user_id(source_user_id_int)
-            except (ValueError, TypeError):
+    # Map author_id from member_id (same as user_id for runs)
+    source_user_id = case_dict.get('member_id') or case_dict.get('created_by') or case_dict.get('author_id')
+    target_author_id = 1
+    if source_user_id:
+        try:
+            source_user_id_int = int(source_user_id)
+            if source_user_id_int == 0:
                 target_author_id = 1
+            else:
+                target_author_id = mappings.get_user_id(source_user_id_int)
+        except (ValueError, TypeError):
+            target_author_id = 1
     
     case_data = {
         'title': case_dict.get('title', ''),
@@ -142,35 +98,22 @@ def transform_case_data(
         'updated_at': updated_at,
         'author_id': target_author_id,
         'milestone_id': milestone_mapping.get(case_dict.get('milestone_id')) if case_dict.get('milestone_id') else None,
-        'attachments': [],  # Will be mapped below
+        'attachments': [],
         'is_flaky': case_dict.get('is_flaky', 0),
         'custom_field': {}
     }
     
     # Extract and process params
-    # Qase SDK expects params as dict format: {"Browser": ["Chrome"], "User1": ["Password"]}
     source_params = case_dict.get('params')
     source_parameters = case_dict.get('parameters')
-    
-    # Check if case has parameters structure (need raw HTTP API to preserve structure)
-    has_parameters_structure = False
-    has_group_parameters = False
-    if source_parameters and isinstance(source_parameters, list):
-        has_parameters_structure = True
-        has_group_parameters = any(
-            isinstance(p, dict) and p.get('type') == 'group'
-            for p in source_parameters
-        )
     
     if source_params and isinstance(source_params, dict) and len(source_params) > 0:
         case_data['params'] = source_params
     else:
-        # Empty params must be empty dict for SDK validation
         case_data['params'] = {}
     
-    # Preserve parameters structure for cases with parameters field (will use raw HTTP API)
-    # This preserves both single and group parameters in their proper structure
-    if has_parameters_structure and source_parameters:
+    # Preserve parameters structure for cases with parameters field
+    if source_parameters and isinstance(source_parameters, list):
         parameters_list = []
         for param_item in source_parameters:
             param_dict = to_dict(param_item) if not isinstance(param_item, dict) else param_item
@@ -189,15 +132,14 @@ def transform_case_data(
                     elif source_shared_id in shared_parameter_mapping:
                         target_shared_id = shared_parameter_mapping[source_shared_id]
                 
-                # If this is a shared parameter reference, use simplified format: {"shared_id": "..."}
+                # Shared parameter reference
                 if target_shared_id:
                     parameters_list.append({
                         'shared_id': str(target_shared_id)
                     })
                     continue
                 
-                # Handle single type parameter (non-shared)
-                # API format: {"title": "...", "values": [...]}
+                # Handle single type parameter
                 if param_type == 'single' and 'item' in param_dict:
                     item = param_dict['item']
                     item_dict = to_dict(item) if not isinstance(item, dict) else item
@@ -209,8 +151,7 @@ def transform_case_data(
                                 'title': param_name,
                                 'values': param_values if isinstance(param_values, list) else [param_values]
                             })
-                # Handle group type parameter - preserve as group (non-shared)
-                # API format: {"items": [{"title": "...", "values": [...]}, ...]}
+                # Handle group type parameter
                 elif param_type == 'group' and 'items' in param_dict:
                     items = param_dict['items']
                     if isinstance(items, list):
@@ -300,20 +241,17 @@ def transform_case_data(
         for step in case_dict['steps']:
             step_dict = to_dict(step)
             
-            # Check for shared step reference in various formats
+            # Check for shared step reference
             source_hash = None
             if isinstance(step_dict, dict):
-                # Format 1: {"shared": "hash"}
                 if 'shared' in step_dict:
                     source_hash = step_dict['shared']
-                # Format 2: {"shared_step": {"hash": "..."}}
                 elif 'shared_step' in step_dict:
                     shared_step_obj = step_dict['shared_step']
                     if isinstance(shared_step_obj, dict):
                         source_hash = shared_step_obj.get('hash')
                     elif hasattr(shared_step_obj, 'hash'):
                         source_hash = getattr(shared_step_obj, 'hash', None)
-                # Format 3: Check if step has a shared_step_hash field
                 elif 'shared_step_hash' in step_dict:
                     source_hash = step_dict['shared_step_hash']
             
@@ -380,8 +318,6 @@ def migrate_cases(
     """
     from migration.extract.cases import extract_cases
     
-    cases_api_target = CasesApi(target_service.client)
-    
     case_mapping = {}
     limit = 100 if not target_service.enterprise else 20
     
@@ -423,7 +359,6 @@ def migrate_cases(
         batch_cases = all_source_cases[batch_start:batch_start + batch_size]
         
         cases_to_create = []
-        cases_with_shared_steps = []  # Also includes cases with group parameters
         
         for case_dict in batch_cases:
             case_data = transform_case_data(
@@ -436,51 +371,25 @@ def migrate_cases(
                 continue
             
             source_id = case_dict.get('id')
-            has_shared_steps = any(
-                isinstance(step, dict) and 'shared' in step
-                for step in case_data.get('steps', [])
-            )
-            has_parameters_structure = case_data.pop('_has_parameters_structure', False)
-            
-            if has_shared_steps or has_parameters_structure:
-                case_data['_source_id'] = source_id
-                cases_with_shared_steps.append(case_data)
-            else:
-                cases_to_create.append((source_id, TestCasebulkCasesInner(**case_data)))
+            case_data.pop('_has_parameters_structure', False)
+            case_data['_source_id'] = source_id
+            cases_to_create.append(case_data)
         
-        # Create cases without shared steps using SDK
+        # Create cases using raw API
         if cases_to_create:
-            case_objects = [case_obj for _, case_obj in cases_to_create]
-            source_ids = [source_id for source_id, _ in cases_to_create]
+            case_data_list = []
+            source_ids_batch = []
             
-            bulk_data = TestCasebulk(cases=case_objects)
-            bulk_response = retry_with_backoff(
-                cases_api_target.bulk,
-                code=project_code_target,
-                test_casebulk=bulk_data
-            )
-            
-            response_ids = None
-            if bulk_response:
-                if hasattr(bulk_response, 'ids') and bulk_response.ids:
-                    response_ids = bulk_response.ids
-                elif hasattr(bulk_response, 'result') and bulk_response.result:
-                    if hasattr(bulk_response.result, 'ids') and bulk_response.result.ids:
-                        response_ids = bulk_response.result.ids
-                    elif hasattr(bulk_response.result, 'entities'):
-                        response_ids = [e.id for e in bulk_response.result.entities if hasattr(e, 'id')]
-            
-            if response_ids:
-                for idx, source_id in enumerate(source_ids):
-                    if idx < len(response_ids):
-                        case_mapping[source_id] = response_ids[idx]
-        
-        if cases_with_shared_steps:
-            for case_data in cases_with_shared_steps:
+            for case_data in cases_to_create:
                 source_id = case_data.pop('_source_id')
-                created_ids = raw_api_client.create_cases_bulk(project_code_target, [case_data])
-                if created_ids and len(created_ids) > 0:
-                    case_mapping[source_id] = created_ids[0]
+                case_data_list.append(case_data)
+                source_ids_batch.append(source_id)
+            
+            created_ids = raw_api_client.create_cases_bulk(project_code_target, case_data_list)
+            if created_ids:
+                for idx, source_id in enumerate(source_ids_batch):
+                    if idx < len(created_ids):
+                        case_mapping[source_id] = created_ids[idx]
     
     if project_code_source not in mappings.cases:
         mappings.cases[project_code_source] = {}

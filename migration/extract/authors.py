@@ -1,5 +1,5 @@
 """
-Extract results from source Qase workspace.
+Extract authors from source Qase workspace.
 """
 import logging
 import requests
@@ -9,20 +9,18 @@ from qase_service import QaseService
 logger = logging.getLogger(__name__)
 
 
-def extract_results(source_service: QaseService, project_code: str, run_id: int) -> List[Dict[str, Any]]:
+def extract_authors(source_service: QaseService) -> Dict[str, int]:
     """
-    Extract test results from a specific run.
-    Uses raw HTTP API to get full response including member_id field.
+    Extract authors from source workspace using raw HTTP API.
+    Builds a mapping: author_uuid -> author_id
     
     Args:
         source_service: Source Qase service
-        project_code: Project code
-        run_id: Run ID
     
     Returns:
-        List of result dictionaries with full details including member_id
+        Dictionary mapping author_uuid -> author_id
     """
-    results = []
+    author_uuid_to_id = {}
     
     # Get API configuration from service
     try:
@@ -34,29 +32,28 @@ def extract_results(source_service: QaseService, project_code: str, run_id: int)
             api_token = None
     except Exception:
         logger.error("Cannot get API token/URL from service")
-        return results
+        return author_uuid_to_id
     
     if not api_token or not base_url:
         logger.error("API token or base URL not available")
-        return results
+        return author_uuid_to_id
     
-    # Use raw HTTP API to get full response including member_id
+    # Use raw HTTP API to get authors
     api_base = base_url.rstrip('/')
     if not api_base.endswith('/v1'):
         api_base = f"{api_base}/v1"
     
     offset = 0
-    limit = 100  # API limit is max 100
+    limit = 100
     
     while True:
         try:
-            url = f"{api_base}/result/{project_code}"
+            url = f"{api_base}/author"
             headers = {
                 'Token': api_token,
                 'accept': 'application/json'
             }
             params = {
-                'run': str(run_id),
                 'limit': limit,
                 'offset': offset
             }
@@ -71,7 +68,11 @@ def extract_results(source_service: QaseService, project_code: str, run_id: int)
                         entities_list = result
                     
                     if entities_list:
-                        results.extend(entities_list)
+                        for author in entities_list:
+                            author_uuid = author.get('uuid')
+                            author_id = author.get('id')  # Use 'id' field, not 'author_id'
+                            if author_uuid and author_id:
+                                author_uuid_to_id[author_uuid] = int(author_id)
                         
                         # Check if there are more pages
                         total = result.get('total', len(entities_list))
@@ -84,10 +85,11 @@ def extract_results(source_service: QaseService, project_code: str, run_id: int)
                     logger.warning(f"Unexpected response format: {response_data}")
                     break
             else:
-                logger.error(f"Failed to fetch results via raw API: {response.status_code} - {response.text[:200]}")
+                logger.error(f"Failed to fetch authors via raw API: {response.status_code} - {response.text[:200]}")
                 break
         except Exception as e:
-            logger.error(f"Failed to fetch results via raw API: {e}")
+            logger.error(f"Failed to fetch authors via raw API: {e}")
             break
     
-    return results
+    logger.info(f"Extracted {len(author_uuid_to_id)} author UUID mappings")
+    return author_uuid_to_id
