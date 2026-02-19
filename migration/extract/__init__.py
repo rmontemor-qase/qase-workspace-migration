@@ -9,6 +9,7 @@ from migration.extract.configurations import extract_configurations
 from migration.extract.shared_steps import extract_shared_steps
 from migration.extract.suites import extract_suites
 from migration.extract.plans import extract_plans
+from migration.extract.groups import extract_groups
 
 __all__ = [
     'extract_projects',
@@ -19,4 +20,5 @@ __all__ = [
     'extract_shared_steps',
     'extract_suites',
     'extract_plans',
+    'extract_groups',
 ]

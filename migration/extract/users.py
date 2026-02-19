@@ -2,7 +2,7 @@
 Extract users from source Qase workspace.
 """
 import logging
-from typing import Dict
+from typing import List, Dict, Any
 from qase.api_client_v1.api.authors_api import AuthorsApi
 from qase_service import QaseService
 from migration.utils import retry_with_backoff, extract_entities_from_response, to_dict
@@ -10,17 +10,17 @@ from migration.utils import retry_with_backoff, extract_entities_from_response, 
 logger = logging.getLogger(__name__)
 
 
-def extract_users(source_service: QaseService) -> Dict[str, int]:
+def extract_users(source_service: QaseService) -> List[Dict[str, Any]]:
     """
     Extract users from source workspace.
     
     Returns:
-        Dictionary mapping email -> user_id
+        List of user dictionaries with full user information
     """
     logger.info("Extracting users from source workspace...")
     authors_api_source = AuthorsApi(source_service.client)
     
-    source_users = {}
+    source_users = []
     offset = 0
     limit = 100
     
@@ -38,7 +38,7 @@ def extract_users(source_service: QaseService) -> Dict[str, int]:
         
         for user in entities:
             user_dict = to_dict(user)
-            source_users[user_dict.get('email', '')] = user_dict.get('id')
+            source_users.append(user_dict)
         
         if len(entities) < limit:
             break

@@ -2,11 +2,11 @@
 Create runs in target Qase workspace.
 """
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 from qase.api_client_v1.api.runs_api import RunsApi
 from qase.api_client_v1.models import RunCreate
 from qase_service import QaseService
-from migration.utils import MigrationMappings, MigrationStats, retry_with_backoff, format_datetime, to_dict
+from migration.utils import MigrationMappings, MigrationStats, retry_with_backoff, format_datetime
 from migration.extract.runs import extract_runs, extract_run_cases
 
 logger = logging.getLogger(__name__)
@@ -33,6 +33,19 @@ def migrate_runs(
     """
     runs_api_target = RunsApi(target_service.client)
     
+    # Normalize user_mapping: ensure keys are integers (JSON may store them as strings)
+    if user_mapping:
+        first_key = next(iter(user_mapping.keys()), None)
+        if first_key is not None and isinstance(first_key, str):
+            user_mapping = {int(k): v for k, v in user_mapping.items()}
+    else:
+        # Fallback to mappings.users if user_mapping is empty
+        user_mapping = getattr(mappings, 'users', {})
+        if user_mapping:
+            first_key = next(iter(user_mapping.keys()), None)
+            if first_key is not None and isinstance(first_key, str):
+                user_mapping = {int(k): v for k, v in user_mapping.items()}
+    
     run_mapping = {}
     source_runs = extract_runs(source_service, project_code_source)
     
@@ -57,10 +70,9 @@ def migrate_runs(
                     
                     if case_id:
                         target_case_id = case_mapping.get(int(case_id))
-                        if target_case_id and target_case_id not in target_cases:
+                        if                         target_case_id and target_case_id not in target_cases:
                             target_cases.append(target_case_id)
         
-        target_configs = []
         target_configs = []
         source_configs = run_dict.get('configurations', [])
         if source_configs:
@@ -78,15 +90,37 @@ def migrate_runs(
                     if target_config_id:
                         target_configs.append(target_config_id)
         
+        # Map author_id: Qase API returns 'user_id' field in run data
+        source_user_id = run_dict.get('user_id') or run_dict.get('created_by') or run_dict.get('author_id') or run_dict.get('member_id')
+        if source_user_id:
+            try:
+                source_user_id_int = int(source_user_id)
+                # Skip if user_id is 0 (system/automated runs)
+                if source_user_id_int == 0:
+                    target_author_id = 1
+                else:
+                    target_author_id = mappings.get_user_id(source_user_id_int)
+            except (ValueError, TypeError):
+                target_author_id = 1
+        else:
+            target_author_id = 1
+        
         run_data_dict = {
             'title': run_dict.get('title', ''),
             'description': run_dict.get('description', ''),
-            'start_time': format_datetime(run_dict.get('start_time')),
-            'author_id': user_mapping.get(run_dict.get('author_id'), 1),
+            'author_id': target_author_id,
         }
         
-        if run_dict.get('end_time'):
-            run_data_dict['end_time'] = format_datetime(run_dict.get('end_time'))
+        # Format and include start_time only if valid
+        start_time_formatted = format_datetime(run_dict.get('start_time'))
+        if start_time_formatted:
+            run_data_dict['start_time'] = start_time_formatted
+        
+        # Format and include end_time only if valid
+        end_time_formatted = format_datetime(run_dict.get('end_time'))
+        if end_time_formatted:
+            run_data_dict['end_time'] = end_time_formatted
+        
         if target_cases:
             run_data_dict['cases'] = target_cases
         if target_configs:

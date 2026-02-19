@@ -11,7 +11,8 @@ import certifi
 class QaseService:
     """Service class for interacting with Qase API."""
     
-    def __init__(self, api_token: str, host: str = "qase.io", ssl: bool = True, enterprise: bool = False):
+    def __init__(self, api_token: str, host: str = "qase.io", ssl: bool = True, 
+                 enterprise: bool = False, scim_token: str = None, scim_host: str = None):
         """
         Initialize Qase API clients.
         
@@ -20,11 +21,24 @@ class QaseService:
             host: Qase host (default: "qase.io")
             ssl: Use SSL (default: True)
             enterprise: Is enterprise instance (default: False)
+            scim_token: SCIM token for user/group management (optional)
+            scim_host: SCIM host (default: "app.qase.io" or derived from host)
         """
         self.api_token = api_token
         self.host = host
         self.ssl = ssl
         self.enterprise = enterprise
+        self.scim_token = scim_token
+        
+        # Determine SCIM host
+        if scim_host:
+            self.scim_host = scim_host
+        elif enterprise:
+            # For enterprise, SCIM might be on the same domain
+            self.scim_host = host
+        else:
+            # Default cloud SCIM host
+            self.scim_host = "app.qase.io"
         
         # Determine API host format
         # Cloud: api.qase.io/v1
@@ -51,3 +65,10 @@ class QaseService:
         
         # Add custom header for migration
         self.client_v2.default_headers['migration'] = 'true'
+        
+        # Initialize SCIM client if token is provided
+        if scim_token:
+            from migration.utils.scim_client import QaseScimClient
+            self.scim_client = QaseScimClient(scim_token, self.scim_host, ssl)
+        else:
+            self.scim_client = None

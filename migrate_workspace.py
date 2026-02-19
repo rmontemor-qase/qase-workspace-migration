@@ -28,7 +28,8 @@ from migration.create import (
     migrate_cases,
     migrate_plans,
     migrate_runs,
-    migrate_results
+    migrate_results,
+    migrate_groups
 )
 
 logging.basicConfig(
@@ -149,6 +150,15 @@ def main():
     """Main migration function."""
     args = parse_args()
     
+    # Load full config for user/group migration options
+    config_path = 'config.json'
+    config = {}
+    if Path(config_path).exists():
+        try:
+            config = load_config(config_path)
+        except Exception as e:
+            logger.warning(f"Could not load config.json: {e}")
+    
     logger.info("="*60)
     logger.info("QASE WORKSPACE MIGRATION")
     logger.info("="*60)
@@ -156,18 +166,31 @@ def main():
     logger.info(f"Target: {args.target_host}")
     logger.info("="*60)
     
+    # Get SCIM configuration
+    source_config = config.get('source', {})
+    target_config = config.get('target', {})
+    
+    source_scim_token = source_config.get('scim_token')
+    source_scim_host = source_config.get('scim_host')
+    target_scim_token = target_config.get('scim_token')
+    target_scim_host = target_config.get('scim_host')
+    
     source_service = QaseService(
         api_token=args.source_token,
         host=args.source_host,
         ssl=args.source_ssl,
-        enterprise=args.source_enterprise
+        enterprise=args.source_enterprise,
+        scim_token=source_scim_token,
+        scim_host=source_scim_host
     )
     
     target_service = QaseService(
         api_token=args.target_token,
         host=args.target_host,
         ssl=args.target_ssl,
-        enterprise=args.target_enterprise
+        enterprise=args.target_enterprise,
+        scim_token=target_scim_token,
+        scim_host=target_scim_host
     )
     
     mappings = MigrationMappings()
@@ -199,11 +222,56 @@ def main():
         
         mappings.save_to_file(args.mappings_file)
         
-        logger.info("\n" + "="*60)
-        logger.info("STEP 2: Mapping Users (Workspace Level)")
-        logger.info("="*60)
-        user_mapping = migrate_users(source_service, target_service, mappings, stats)
-        mappings.save_to_file(args.mappings_file)
+        # Check if user migration is enabled
+        users_config = config.get('users', {})
+        migrate_users_flag = users_config.get('migrate', False)
+        
+        if migrate_users_flag:
+            logger.info("\n" + "="*60)
+            logger.info("STEP 2: Migrating Users (Workspace Level)")
+            logger.info("="*60)
+            try:
+                user_mapping = migrate_users(source_service, target_service, mappings, stats, config)
+                # Ensure user_mapping keys are integers (in case it was loaded from JSON with string keys)
+                if user_mapping:
+                    first_key = next(iter(user_mapping.keys()), None)
+                    if first_key is not None and isinstance(first_key, str):
+                        user_mapping = {int(k): v for k, v in user_mapping.items()}
+                mappings.save_to_file(args.mappings_file)
+                
+                logger.info("\n" + "="*60)
+                logger.info("STEP 2.5: Migrating Groups (Workspace Level)")
+                logger.info("="*60)
+                try:
+                    group_mapping = migrate_groups(source_service, target_service, user_mapping, mappings, stats, config)
+                    mappings.save_to_file(args.mappings_file)
+                except Exception as e:
+                    logger.error(f"✗ Groups migration failed: {e}", exc_info=True)
+                    mappings.save_to_file(args.mappings_file)
+            except Exception as e:
+                logger.error(f"✗ User migration failed: {e}", exc_info=True)
+                # Create fallback mapping using default user ID
+                logger.warning("Creating fallback user mapping using default user ID")
+                from migration.extract.users import extract_users
+                try:
+                    source_users = extract_users(source_service)
+                    default_user_id = users_config.get('default', 1)
+                    user_mapping = {user.get('id'): default_user_id for user in source_users if user.get('id')}
+                    mappings.users = user_mapping
+                    stats.add_entity('users', len(source_users), len(user_mapping))
+                except Exception as fallback_error:
+                    logger.error(f"Failed to create fallback user mapping: {fallback_error}")
+                    user_mapping = {}
+                mappings.save_to_file(args.mappings_file)
+        else:
+            logger.info("\n" + "="*60)
+            logger.info("STEP 2: User Migration (SKIPPED - users.migrate: false)")
+            logger.info("="*60)
+            logger.info("User migration is disabled. Skipping user and group migration entirely.")
+            # Create empty user mapping - will use default user ID (1) for all references
+            user_mapping = {}
+            mappings.users = user_mapping
+            mappings.save_to_file(args.mappings_file)
         
         logger.info("\n" + "="*60)
         logger.info("STEP 3: Migrating Custom Fields (Workspace Level)")
@@ -370,7 +438,8 @@ def main():
                     run_mapping,
                     case_mapping,
                     mappings,
-                    stats
+                    stats,
+                    user_mapping
                 )
                 mappings.save_to_file(args.mappings_file)
             except Exception as e:

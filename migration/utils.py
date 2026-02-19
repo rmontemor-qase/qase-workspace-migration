@@ -35,6 +35,8 @@ class MigrationMappings:
         self.shared_parameters = {}
         self.custom_fields = {}
         self.users = {}
+        self.user_email_mapping = {}  # email -> target_user_id mapping
+        self.user_uuid_mapping = {}  # source_user_uuid -> target_user_id mapping
         self.attachments = {}
         self.plans = {}
         self.target_workspace_hash = None
@@ -54,11 +56,32 @@ class MigrationMappings:
             'shared_parameters': self.shared_parameters,
             'custom_fields': self.custom_fields,
             'users': self.users,
+            'user_email_mapping': getattr(self, 'user_email_mapping', {}),
+            'user_uuid_mapping': getattr(self, 'user_uuid_mapping', {}),
             'attachments': self.attachments,
             'plans': self.plans
         }
         with open(filepath, 'w') as f:
             json.dump(mappings_dict, f, indent=2)
+    
+    def get_user_id(self, id: int, default_user_id: int = 1) -> int:
+        """
+        Get target user ID from source user ID.
+        
+        Following QASE_AUTHOR_ID_BREAKDOWN.md pattern:
+        - Maps source workspace user ID to target workspace user ID
+        - Falls back to default_user_id if mapping not found
+        
+        Args:
+            id: Source user ID
+            default_user_id: Fallback user ID if mapping not found (default: 1)
+        
+        Returns:
+            Target user ID or default_user_id
+        """
+        if id in self.users:
+            return self.users[id]
+        return default_user_id
     
     def load_from_file(self, filepath: str):
         """Load mappings from JSON file."""
@@ -76,7 +99,11 @@ class MigrationMappings:
             self.shared_steps = mappings_dict.get('shared_steps', {})
             self.shared_parameters = mappings_dict.get('shared_parameters', {})
             self.custom_fields = mappings_dict.get('custom_fields', {})
-            self.users = mappings_dict.get('users', {})
+            # Convert user mapping keys from strings to integers (JSON stores keys as strings)
+            users_dict = mappings_dict.get('users', {})
+            self.users = {int(k): v for k, v in users_dict.items() if k} if users_dict else {}
+            self.user_email_mapping = mappings_dict.get('user_email_mapping', {})
+            self.user_uuid_mapping = mappings_dict.get('user_uuid_mapping', {})
             self.attachments = mappings_dict.get('attachments', {})
             self.plans = mappings_dict.get('plans', {})
             self.target_workspace_hash = mappings_dict.get('target_workspace_hash')
@@ -269,14 +296,52 @@ def format_datetime(dt: Any) -> Optional[str]:
     
     if isinstance(dt, str):
         try:
-            for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d']:
+            # Handle ISO 8601 format with timezone (e.g., "2026-01-13T13:31:55+00:00")
+            # Remove timezone info and parse
+            dt_clean = dt.strip()
+            
+            # Remove timezone offset (e.g., "+00:00", "-05:00", or "Z")
+            if dt_clean.endswith('Z'):
+                dt_clean = dt_clean[:-1]
+            elif '+' in dt_clean:
+                # Split on '+' to remove timezone offset
+                dt_clean = dt_clean.split('+')[0]
+            elif '-' in dt_clean and dt_clean.count('-') > 2:
+                # Handle negative timezone (e.g., "2026-01-13T13:31:55-05:00")
+                # Find the last '-' that's part of the timezone
+                parts = dt_clean.rsplit('-', 2)
+                if len(parts) == 3 and ':' in parts[2]:
+                    # Last part is timezone, remove it
+                    dt_clean = '-'.join(parts[:2])
+            
+            # Try parsing various formats (order matters - try more specific first)
+            formats = [
+                '%Y-%m-%d %H:%M:%S.%f',  # With microseconds
+                '%Y-%m-%d %H:%M:%S',     # Standard format
+                '%Y-%m-%dT%H:%M:%S.%f',  # ISO with microseconds
+                '%Y-%m-%dT%H:%M:%S',     # ISO format
+                '%Y-%m-%d',              # Date only
+            ]
+            
+            for fmt in formats:
                 try:
-                    parsed = datetime.strptime(dt, fmt)
+                    parsed = datetime.strptime(dt_clean, fmt)
                     return parsed.strftime('%Y-%m-%d %H:%M:%S')
                 except ValueError:
                     continue
+            
+            # If all parsing fails, try using datetime.fromisoformat (Python 3.7+)
+            try:
+                parsed = datetime.fromisoformat(dt.replace('Z', '+00:00'))
+                return parsed.strftime('%Y-%m-%d %H:%M:%S')
+            except (ValueError, AttributeError):
+                pass
+            
+            # Last resort: return as-is (might cause API error, but better than None)
+            logger.warning(f"Could not parse datetime format: {dt}, returning as-is")
             return dt
-        except:
+        except Exception as e:
+            logger.warning(f"Error formatting datetime {dt}: {e}, returning as-is")
             return dt
     
     if isinstance(dt, datetime):

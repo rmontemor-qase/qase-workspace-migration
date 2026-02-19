@@ -2,7 +2,8 @@
 Extract runs from source Qase workspace.
 """
 import logging
-from typing import List, Dict, Any, Optional
+import requests
+from typing import List, Dict, Any
 from qase.api_client_v1.api.runs_api import RunsApi
 from qase_service import QaseService
 from migration.utils import retry_with_backoff, extract_entities_from_response, to_dict
@@ -13,38 +14,81 @@ logger = logging.getLogger(__name__)
 def extract_runs(source_service: QaseService, project_code: str) -> List[Dict[str, Any]]:
     """
     Extract test runs from source project.
+    Uses raw HTTP API to get full response including user_id field.
     
     Args:
         source_service: Source Qase service
         project_code: Project code
     
     Returns:
-        List of run dictionaries
+        List of run dictionaries with full details including user_id
     """
-    runs_api_source = RunsApi(source_service.client)
-    
     runs = []
+    
+    # Get API configuration from service
+    try:
+        base_url = source_service.client.configuration.host
+        api_key_dict = source_service.client.configuration.api_key
+        if isinstance(api_key_dict, dict):
+            api_token = api_key_dict.get('TokenAuth') or api_key_dict.get('Token') or api_key_dict.get('token')
+        else:
+            api_token = None
+    except Exception:
+        logger.error("Cannot get API token/URL from service")
+        return runs
+    
+    if not api_token or not base_url:
+        logger.error("API token or base URL not available")
+        return runs
+    
+    # Use raw HTTP API to get full response including user_id
+    api_base = base_url.rstrip('/')
+    if not api_base.endswith('/v1'):
+        api_base = f"{api_base}/v1"
+    
     offset = 0
     limit = 100
     
     while True:
-        api_response = retry_with_backoff(
-            runs_api_source.get_runs,
-            code=project_code,
-            limit=limit,
-            offset=offset
-        )
-        
-        entities = extract_entities_from_response(api_response)
-        if not entities:
+        try:
+            url = f"{api_base}/run/{project_code}"
+            headers = {
+                'Token': api_token,
+                'accept': 'application/json'
+            }
+            params = {
+                'limit': limit,
+                'offset': offset
+            }
+            
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+            if response.status_code == 200:
+                response_data = response.json()
+                if response_data.get('status') and response_data.get('result'):
+                    result = response_data['result']
+                    entities_list = result.get('entities', [])
+                    if not entities_list and isinstance(result, list):
+                        entities_list = result
+                    
+                    if entities_list:
+                        runs.extend(entities_list)
+                        
+                        # Check if there are more pages
+                        total = result.get('total', len(entities_list))
+                        if len(entities_list) < limit or offset + len(entities_list) >= total:
+                            break
+                        offset += limit
+                    else:
+                        break
+                else:
+                    logger.warning(f"Unexpected response format: {response_data}")
+                    break
+            else:
+                logger.error(f"Failed to fetch runs via raw API: {response.status_code} - {response.text[:200]}")
+                break
+        except Exception as e:
+            logger.error(f"Failed to fetch runs via raw API: {e}")
             break
-        
-        for run in entities:
-            runs.append(to_dict(run))
-        
-        if len(entities) < limit:
-            break
-        offset += limit
     
     return runs
 

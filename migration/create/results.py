@@ -27,12 +27,39 @@ from migration.extract.results import extract_results
 logger = logging.getLogger(__name__)
 
 
+def _get_target_user_id(source_user_id: Any, user_mapping: Dict[int, int], default_user_id: int = 1) -> int:
+    """
+    Get target user ID from source user ID using user_mapping.
+    
+    Following QASE_AUTHOR_ID_BREAKDOWN.md pattern:
+    - Maps source workspace user ID to target workspace user ID
+    - Falls back to default_user_id if mapping not found
+    
+    Args:
+        source_user_id: Source user ID (from created_by or author_id field)
+        user_mapping: Dictionary mapping source_id -> target_id (built via email matching)
+        default_user_id: Fallback user ID if mapping not found (default: 1)
+    
+    Returns:
+        Target user ID or default_user_id
+    """
+    if not source_user_id:
+        return default_user_id
+    
+    try:
+        source_user_id_int = int(source_user_id)
+        return user_mapping.get(source_user_id_int, default_user_id)
+    except (ValueError, TypeError):
+        return default_user_id
+
+
 def transform_result_data(
     result_dict: Dict[str, Any],
     target_case_id: int,
     case_title: str,
     attachment_mapping: Dict[str, str],
-    mappings: MigrationMappings
+    mappings: MigrationMappings,
+    user_mapping: Dict[int, int] = None
 ) -> ResultCreateV2:
     """
     Transform a result dictionary from source format to ResultCreateV2 format.
@@ -196,14 +223,50 @@ def transform_result_data(
         target_workspace_hash = getattr(mappings, 'target_workspace_hash', None)
         result_comment = replace_attachment_hashes_in_text(result_comment, attachment_mapping, target_workspace_hash)
     
-    return ResultCreateV2(
-        title=case_title,
-        testops_id=target_case_id,
-        execution=execution,
-        message=result_comment if result_comment else None,
-        attachments=mapped_result_attachments if mapped_result_attachments else None,
-        steps=result_steps if result_steps else None
-    )
+    # Map author_id: Qase API returns 'author_uuid' field in result data
+    # Use UUID mapping first (most reliable), then fallback to member_id/user_id/created_by/author_id
+    # Note: ResultCreateV2 may not support author_id - if not, it will be ignored by SDK
+    result_data_kwargs = {
+        'title': case_title,
+        'testops_id': target_case_id,
+        'execution': execution,
+        'message': result_comment if result_comment else None,
+        'attachments': mapped_result_attachments if mapped_result_attachments else None,
+        'steps': result_steps if result_steps else None
+    }
+    
+    # Add author_id if mappings.users is available and ResultCreateV2 supports it
+    target_author_id = 1  # Default
+    author_uuid = result_dict.get('author_uuid')
+    
+    if author_uuid:
+        # Try UUID mapping first (author_uuid -> target_user_id)
+        user_uuid_mapping = getattr(mappings, 'user_uuid_mapping', {})
+        target_author_id = user_uuid_mapping.get(str(author_uuid), 1)
+    else:
+        # Fallback to member_id/user_id/created_by/author_id if UUID not available
+        source_user_id = result_dict.get('member_id') or result_dict.get('user_id') or result_dict.get('created_by') or result_dict.get('author_id')
+        if source_user_id:
+            try:
+                source_user_id_int = int(source_user_id)
+                # Skip if user_id is 0 (system/automated results)
+                if source_user_id_int == 0:
+                    target_author_id = 1  # Default user for automated results
+                else:
+                    # Use mappings.get_user_id() method (per document pattern)
+                    target_author_id = mappings.get_user_id(source_user_id_int)
+            except (ValueError, TypeError):
+                target_author_id = 1
+    
+    # Try to add author_id - SDK will ignore if not supported
+    if target_author_id != 1:  # Only add if not default
+        try:
+            result_data_kwargs['author_id'] = target_author_id
+        except TypeError:
+            # ResultCreateV2 doesn't support author_id parameter
+            logger.debug(f"ResultCreateV2 doesn't support author_id parameter, skipping")
+    
+    return ResultCreateV2(**result_data_kwargs)
 
 
 def migrate_results(
@@ -214,7 +277,8 @@ def migrate_results(
     run_mapping: Dict[int, int],
     case_mapping: Dict[int, int],
     mappings: MigrationMappings,
-    stats: MigrationStats
+    stats: MigrationStats,
+    user_mapping: Dict[int, int] = None
 ):
     """
     Migrate test results for a project using API v2.
@@ -223,6 +287,19 @@ def migrate_results(
     results_api_target = ResultsApiV2(target_service.client_v2)
     cases_api_target = CasesApi(target_service.client)
     runs_api_target = RunsApi(target_service.client)
+    
+    # Normalize user_mapping: ensure keys are integers (JSON may store them as strings)
+    if user_mapping:
+        first_key = next(iter(user_mapping.keys()), None)
+        if first_key is not None and isinstance(first_key, str):
+            user_mapping = {int(k): v for k, v in user_mapping.items()}
+    else:
+        # Fallback to mappings.users if user_mapping is empty
+        user_mapping = getattr(mappings, 'users', {})
+        if user_mapping:
+            first_key = next(iter(user_mapping.keys()), None)
+            if first_key is not None and isinstance(first_key, str):
+                user_mapping = {int(k): v for k, v in user_mapping.items()}
     
     total_results = 0
     created_results = 0

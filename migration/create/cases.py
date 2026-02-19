@@ -17,6 +17,36 @@ from migration.transform.attachments import replace_attachment_hashes_in_text
 logger = logging.getLogger(__name__)
 
 
+def _get_target_user_id(source_user_id: Any, user_mapping: Dict[int, int], default_user_id: int = 1) -> int:
+    """
+    Get target user ID from source user ID using user_mapping.
+    
+    Following QASE_AUTHOR_ID_BREAKDOWN.md pattern:
+    - Maps source workspace user ID to target workspace user ID
+    - Falls back to default_user_id if mapping not found
+    
+    The user_mapping is already built based on email matching:
+    - Source users are matched to target users by email (case-insensitive)
+    - Mapping is: source_id -> target_id
+    
+    Args:
+        source_user_id: Source user ID (from created_by or author_id field)
+        user_mapping: Dictionary mapping source_id -> target_id (built via email matching)
+        default_user_id: Fallback user ID if mapping not found (default: 1)
+    
+    Returns:
+        Target user ID or default_user_id
+    """
+    if not source_user_id:
+        return default_user_id
+    
+    try:
+        source_user_id_int = int(source_user_id)
+        return user_mapping.get(source_user_id_int, default_user_id)
+    except (ValueError, TypeError):
+        return default_user_id
+
+
 def transform_case_data(
     case_dict: Dict[str, Any],
     suite_mapping: Dict[int, int],
@@ -72,6 +102,30 @@ def transform_case_data(
     else:
         updated_at = None
     
+    # Map author_id: Qase API returns 'author_uuid' field in case data
+    # Use UUID mapping first (most reliable), then fallback to member_id/created_by/author_id
+    target_author_id = 1  # Default
+    author_uuid = case_dict.get('author_uuid')
+    
+    if author_uuid:
+        # Try UUID mapping first (author_uuid -> target_user_id)
+        user_uuid_mapping = getattr(mappings, 'user_uuid_mapping', {})
+        target_author_id = user_uuid_mapping.get(str(author_uuid), 1)
+    else:
+        # Fallback to member_id/created_by/author_id if UUID not available
+        source_user_id = case_dict.get('member_id') or case_dict.get('created_by') or case_dict.get('author_id')
+        if source_user_id:
+            try:
+                source_user_id_int = int(source_user_id)
+                # Skip if user_id is 0 (system/automated cases)
+                if source_user_id_int == 0:
+                    target_author_id = 1  # Default user for automated cases
+                else:
+                    # Use mappings.get_user_id() method (per document pattern)
+                    target_author_id = mappings.get_user_id(source_user_id_int)
+            except (ValueError, TypeError):
+                target_author_id = 1
+    
     case_data = {
         'title': case_dict.get('title', ''),
         'description': case_dict.get('description', ''),
@@ -86,7 +140,7 @@ def transform_case_data(
         'tags': processed_tags,
         'created_at': created_at,
         'updated_at': updated_at,
-        'author_id': user_mapping.get(case_dict.get('author_id'), 1),
+        'author_id': target_author_id,
         'milestone_id': milestone_mapping.get(case_dict.get('milestone_id')) if case_dict.get('milestone_id') else None,
         'attachments': [],  # Will be mapped below
         'is_flaky': case_dict.get('is_flaky', 0),
