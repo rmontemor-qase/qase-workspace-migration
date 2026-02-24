@@ -542,6 +542,38 @@ class QaseRawApiClient:
             logger.error(f"Exception creating results bulk: {e}")
             return False
     
+    def create_run(self, project_code: str, run_data: Dict[str, Any]) -> Optional[int]:
+        """
+        Create a test run using raw HTTP API.
+        This ensures milestone_id and other fields are properly sent.
+        
+        Args:
+            project_code: Project code
+            run_data: Run data dictionary with title, description, milestone_id, etc.
+        
+        Returns:
+            Created run ID if successful, None otherwise
+        """
+        url = f"{self.base_url}/run/{project_code}"
+        
+        try:
+            response = requests.post(url, headers=self.headers, json=run_data, timeout=60)
+            if response.status_code == 200:
+                response_data = response.json()
+                if response_data.get('status') and response_data.get('result'):
+                    result = response_data['result']
+                    if isinstance(result, dict):
+                        return result.get('id')
+                    elif isinstance(result, int):
+                        return result
+                return None
+            else:
+                logger.error(f"Failed to create run: {response.status_code} - {response.text}")
+                return None
+        except Exception as e:
+            logger.error(f"Exception creating run: {e}")
+            return None
+    
     def attach_external_issues(self, project_code: str, links: List[Dict[str, Any]], issue_type: str = "jira-cloud") -> bool:
         """
         Attach external issues to test cases.
