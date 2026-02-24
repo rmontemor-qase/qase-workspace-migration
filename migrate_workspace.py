@@ -29,6 +29,7 @@ from migration.create import (
     migrate_plans,
     migrate_runs,
     migrate_results,
+    migrate_defects,
     migrate_groups
 )
 
@@ -432,7 +433,7 @@ def main():
             
             logger.info(f"\nMigrating test results for {project_code_source}...")
             try:
-                migrate_results(
+                result_hash_mapping = migrate_results(
                     source_service, target_service,
                     project_code_source, project_code_target,
                     run_mapping,
@@ -443,6 +444,33 @@ def main():
                 mappings.save_to_file(args.mappings_file)
             except Exception as e:
                 logger.error(f"✗ Test results migration failed: {e}", exc_info=True)
+                result_hash_mapping = {}
+                mappings.save_to_file(args.mappings_file)
+            
+            logger.info(f"\nMigrating defects for {project_code_source}...")
+            try:
+                # Get attachment mapping for defects
+                attachment_mapping = {}
+                if project_code_source in mappings.attachments:
+                    attachment_mapping = mappings.attachments[project_code_source]
+                    normalized_mapping = {}
+                    for key, value in attachment_mapping.items():
+                        normalized_mapping[key.lower()] = value
+                        normalized_mapping[key] = value
+                    attachment_mapping = normalized_mapping
+                
+                migrate_defects(
+                    source_service, target_service,
+                    project_code_source, project_code_target,
+                    milestone_mapping,
+                    user_mapping,
+                    attachment_mapping,
+                    mappings,
+                    stats
+                )
+                mappings.save_to_file(args.mappings_file)
+            except Exception as e:
+                logger.error(f"✗ Defects migration failed: {e}", exc_info=True)
                 mappings.save_to_file(args.mappings_file)
             
             logger.info(f"\nCompleted migration for project {project_code_source}")

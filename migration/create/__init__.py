@@ -14,6 +14,7 @@ from migration.create.cases import migrate_cases
 from migration.create.plans import migrate_plans
 from migration.create.runs import migrate_runs
 from migration.create.results import migrate_results
+from migration.create.defects import migrate_defects
 from migration.create.attachments import migrate_attachments_workspace
 from migration.create.groups import migrate_groups
 
@@ -31,6 +32,7 @@ __all__ = [
     'migrate_plans',
     'migrate_runs',
     'migrate_results',
+    'migrate_defects',
     'migrate_attachments_workspace',
     'migrate_groups',
 ]

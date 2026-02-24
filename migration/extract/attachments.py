@@ -202,6 +202,59 @@ def extract_attachment_hashes_from_results(
     return all_hashes, url_map
 
 
+def extract_attachment_hashes_from_defects(
+    source_service: QaseService,
+    project_code: str
+) -> tuple[Set[str], Dict[str, str]]:
+    """
+    Extract attachment hashes and URLs from all defects in a project.
+    
+    Args:
+        source_service: Source Qase service
+        project_code: Project code
+    
+    Returns:
+        Tuple of (set of attachment hashes, dict of hash -> URL)
+    """
+    from migration.extract.defects import extract_defects
+    
+    all_hashes = set()
+    url_map = {}
+    
+    defects = extract_defects(source_service, project_code)
+    
+    for defect in defects:
+        defect_dict = to_dict(defect) if hasattr(defect, '__dict__') else defect
+        
+        # Defect-level attachments
+        if defect_dict.get('attachments'):
+            for att_item in defect_dict['attachments']:
+                if isinstance(att_item, str):
+                    all_hashes.add(att_item.lower())
+                elif isinstance(att_item, dict):
+                    if 'hash' in att_item:
+                        hash_val = str(att_item['hash']).lower()
+                        all_hashes.add(hash_val)
+                        if 'url' in att_item:
+                            url_map[hash_val] = att_item['url']
+                    elif 'url' in att_item:
+                        url = att_item['url']
+                        match = re.search(r'/attachment/([a-f0-9]{32,64})/', url, re.IGNORECASE)
+                        if match:
+                            hash_val = match.group(1).lower()
+                            all_hashes.add(hash_val)
+                            url_map[hash_val] = url
+        
+        # Defect text fields (actual_result may contain attachment references)
+        defect_text_fields = ['actual_result']
+        defect_text_hashes = extract_attachment_hashes_from_dict(defect_dict, defect_text_fields)
+        defect_text_urls = extract_attachment_urls_from_dict(defect_dict, defect_text_fields)
+        all_hashes.update(defect_text_hashes)
+        url_map.update(defect_text_urls)
+    
+    return all_hashes, url_map
+
+
 def extract_all_attachment_hashes(
     source_service: QaseService,
     projects: List[Dict[str, Any]]
@@ -219,9 +272,10 @@ def extract_all_attachment_hashes(
         
         case_hashes, case_urls = extract_attachment_hashes_from_cases(source_service, project_code_source)
         result_hashes, result_urls = extract_attachment_hashes_from_results(source_service, project_code_source)
+        defect_hashes, defect_urls = extract_attachment_hashes_from_defects(source_service, project_code_source)
         
-        all_hashes = case_hashes | result_hashes
-        all_urls = {**case_urls, **result_urls}
+        all_hashes = case_hashes | result_hashes | defect_hashes
+        all_urls = {**case_urls, **result_urls, **defect_urls}
         
         all_project_attachments[project_code_source] = (all_hashes, all_urls)
     

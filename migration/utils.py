@@ -40,6 +40,8 @@ class MigrationMappings:
         self.author_uuid_to_id_mapping = {}  # source_author_uuid -> source_author_id mapping
         self.attachments = {}
         self.plans = {}
+        self.defects = {}
+        self.result_hashes = {}
         self.target_workspace_hash = None
     
     def save_to_file(self, filepath: str):
@@ -61,7 +63,9 @@ class MigrationMappings:
             'user_uuid_mapping': getattr(self, 'user_uuid_mapping', {}),
             'author_uuid_to_id_mapping': getattr(self, 'author_uuid_to_id_mapping', {}),
             'attachments': self.attachments,
-            'plans': self.plans
+            'plans': self.plans,
+            'defects': getattr(self, 'defects', {}),
+            'result_hashes': getattr(self, 'result_hashes', {})
         }
         with open(filepath, 'w') as f:
             json.dump(mappings_dict, f, indent=2)
@@ -109,6 +113,8 @@ class MigrationMappings:
             self.author_uuid_to_id_mapping = mappings_dict.get('author_uuid_to_id_mapping', {})
             self.attachments = mappings_dict.get('attachments', {})
             self.plans = mappings_dict.get('plans', {})
+            self.defects = mappings_dict.get('defects', {})
+            self.result_hashes = mappings_dict.get('result_hashes', {})
             self.target_workspace_hash = mappings_dict.get('target_workspace_hash')
         except FileNotFoundError:
             pass
@@ -573,6 +579,108 @@ class QaseRawApiClient:
         except Exception as e:
             logger.error(f"Exception creating run: {e}")
             return None
+    
+    def create_defect(self, project_code: str, defect_data: Dict[str, Any]) -> Optional[int]:
+        """
+        Create a defect using raw HTTP API.
+        
+        Args:
+            project_code: Project code
+            defect_data: Defect data dictionary with title, actual_result, severity, etc.
+        
+        Returns:
+            Created defect ID if successful, None otherwise
+        """
+        url = f"{self.base_url}/defect/{project_code}"
+        
+        try:
+            response = requests.post(url, headers=self.headers, json=defect_data, timeout=60)
+            if response.status_code == 200:
+                response_data = response.json()
+                if response_data.get('status') and response_data.get('result'):
+                    result = response_data['result']
+                    if isinstance(result, dict):
+                        return result.get('id')
+                    elif isinstance(result, int):
+                        return result
+                return None
+            else:
+                logger.error(f"Failed to create defect: {response.status_code} - {response.text[:500]}")
+                return None
+        except Exception as e:
+            logger.error(f"Exception creating defect: {e}")
+            return None
+    
+    def resolve_defect(self, project_code: str, defect_id: int) -> bool:
+        """
+        Resolve a defect using PATCH endpoint.
+        
+        Args:
+            project_code: Project code
+            defect_id: Defect ID to resolve
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        url = f"{self.base_url}/defect/{project_code}/resolve/{defect_id}"
+        
+        try:
+            response = requests.patch(url, headers=self.headers, timeout=60)
+            return response.status_code == 200
+        except Exception:
+            return False
+    
+    def attach_defect_to_results(
+        self,
+        project_code: str,
+        defect_id: int,
+        run_ids: List[int],
+        result_hashes: List[str]
+    ) -> bool:
+        """
+        Attach a defect to runs and results.
+        Since the API doesn't have a public attach endpoint, we try updating the defect.
+        
+        Args:
+            project_code: Project code
+            defect_id: Target defect ID
+            run_ids: List of target run IDs
+            result_hashes: List of target result hashes
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        if not run_ids and not result_hashes:
+            return True
+        
+        # Try updating the defect with runs and results via PUT
+        url = f"{self.base_url}/defect/{project_code}/{defect_id}"
+        payload = {}
+        
+        if run_ids:
+            payload['runs'] = run_ids
+        if result_hashes:
+            payload['results'] = result_hashes
+        
+        try:
+            # Try PUT first
+            response = requests.put(url, headers=self.headers, json=payload, timeout=60)
+            if response.status_code == 200:
+                return True
+            
+            # Try PATCH if PUT doesn't work
+            patch_response = requests.patch(url, headers=self.headers, json=payload, timeout=60)
+            if patch_response.status_code == 200:
+                return True
+                
+        except Exception:
+            pass
+        
+        # If update doesn't work, the defect is created but not linked
+        # Note: Qase API may not support linking defects to runs/results via API token
+        # Defects will need to be manually linked via UI or the linking may happen automatically
+        # if runs/results were included in creation payload
+        return False
     
     def attach_external_issues(self, project_code: str, links: List[Dict[str, Any]], issue_type: str = "jira-cloud") -> bool:
         """
