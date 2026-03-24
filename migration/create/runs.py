@@ -8,8 +8,27 @@ from qase.api_client_v1.models import RunCreate
 from qase_service import QaseService
 from migration.utils import MigrationMappings, MigrationStats, retry_with_backoff, format_datetime, QaseRawApiClient
 from migration.extract.runs import extract_runs, extract_run_cases
+from migration.trace_log import summarize_source_run
 
 logger = logging.getLogger(__name__)
+
+
+def _source_run_should_complete_after_results(run_dict: Dict[str, Any]) -> bool:
+    """
+    Queue complete_run after results migration when the source run was already finished.
+    Raw run list payloads vary: is_completed, end_time, state/status strings, etc.
+    """
+    if run_dict.get("is_completed") or run_dict.get("is_complete"):
+        return True
+    if run_dict.get("end_time"):
+        return True
+    for key in ("state", "status"):
+        raw = run_dict.get(key)
+        if isinstance(raw, str):
+            s = raw.strip().lower()
+            if s in ("completed", "complete", "finished", "done", "closed", "aborted"):
+                return True
+    return False
 
 
 def migrate_runs(
@@ -93,7 +112,15 @@ def migrate_runs(
     
     run_mapping = {}
     source_runs = extract_runs(source_service, project_code_source)
-    
+    trace = getattr(mappings, "trace", None)
+    if trace:
+        trace.event(
+            "runs_phase_start",
+            project_source=project_code_source,
+            project_target=project_code_target,
+            n_source_runs=len(source_runs),
+        )
+
     for run_dict in source_runs:
         source_run_id = run_dict.get('id')
         
@@ -197,7 +224,18 @@ def migrate_runs(
             mapped_plan = plan_mapping.get(run_dict.get('plan_id'))
             if mapped_plan:
                 run_data_dict['plan_id'] = mapped_plan
-        
+
+        if trace:
+            trace.event(
+                "run_extracted",
+                project_source=project_code_source,
+                project_target=project_code_target,
+                source_run_id=source_run_id,
+                extracted=summarize_source_run(run_dict),
+                target_cases_count=len(target_cases),
+                target_configs_count=len(target_configs),
+            )
+
         # Use raw API client if milestone_id is present (SDK may not support it properly)
         # Otherwise fall back to SDK
         if raw_api_client and 'milestone_id' in run_data_dict:
@@ -226,18 +264,44 @@ def migrate_runs(
         
         if create_response and target_run_id:
             run_mapping[source_run_id] = target_run_id
-            is_completed = run_dict.get('is_completed', False)
-            has_end_time = bool(run_dict.get('end_time'))
-            
-            if is_completed or has_end_time:
+            should_complete = _source_run_should_complete_after_results(run_dict)
+            if should_complete:
                 if not hasattr(migrate_runs, '_runs_to_complete'):
                     migrate_runs._runs_to_complete = {}
                 migrate_runs._runs_to_complete[target_run_id] = {
                     'project_code': project_code_target,
                     'is_completed': True,
-                    'source_is_completed': is_completed,
-                    'has_end_time': has_end_time
+                    'source_is_completed': bool(run_dict.get('is_completed') or run_dict.get('is_complete')),
+                    'has_end_time': bool(run_dict.get('end_time')),
                 }
+            if trace:
+                trace.event(
+                    "run_created_target",
+                    project_source=project_code_source,
+                    project_target=project_code_target,
+                    source_run_id=source_run_id,
+                    target_run_id=target_run_id,
+                    payload_sent=run_data_dict,
+                    queued_complete_after_results=should_complete,
+                    complete_reason={
+                        "is_completed": bool(
+                            run_dict.get("is_completed") or run_dict.get("is_complete")
+                        ),
+                        "has_end_time": bool(run_dict.get("end_time")),
+                        "state": run_dict.get("state"),
+                        "status": run_dict.get("status"),
+                    },
+                )
+        elif trace:
+            trace.event(
+                "run_create_failed",
+                project_source=project_code_source,
+                project_target=project_code_target,
+                source_run_id=source_run_id,
+                payload_attempted=run_data_dict,
+                create_response_bool=bool(create_response),
+                target_run_id_resolved=target_run_id,
+            )
     
     if project_code_source not in mappings.runs:
         mappings.runs[project_code_source] = {}
@@ -250,4 +314,15 @@ def migrate_runs(
         delattr(migrate_runs, '_runs_to_complete')
     
     stats.add_entity('runs', len(source_runs), len(run_mapping))
+    if trace:
+        n_qc = 0
+        if hasattr(mappings, "_runs_to_complete") and project_code_source in mappings._runs_to_complete:
+            n_qc = len(mappings._runs_to_complete[project_code_source])
+        trace.event(
+            "runs_phase_end",
+            project_source=project_code_source,
+            n_source_runs=len(source_runs),
+            n_target_runs_mapped=len(run_mapping),
+            n_queued_complete=n_qc,
+        )
     return run_mapping

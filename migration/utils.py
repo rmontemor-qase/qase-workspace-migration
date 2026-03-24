@@ -43,7 +43,9 @@ class MigrationMappings:
         self.defects = {}
         self.result_hashes = {}
         self.target_workspace_hash = None
-    
+        # Optional migration.trace_log.MigrationTrace — not persisted in mappings JSON
+        self.trace = None
+
     def save_to_file(self, filepath: str):
         """Save mappings to JSON file."""
         mappings_dict = {
@@ -547,7 +549,36 @@ class QaseRawApiClient:
         except Exception as e:
             logger.error(f"Exception creating results bulk: {e}")
             return False
-    
+
+    def patch_result(
+        self,
+        project_code: str,
+        run_id: int,
+        result_hash: str,
+        body: Dict[str, Any],
+    ) -> bool:
+        """
+        PATCH a single test result (comment, steps, attachments, etc.).
+        Bulk create often ignores these fields; this matches ResultUpdate.
+        """
+        url = f"{self.base_url}/result/{project_code}/{run_id}/{result_hash}"
+        try:
+            response = requests.patch(
+                url, headers=self.headers, json=body, timeout=120
+            )
+            if response.status_code == 200:
+                return True
+            logger.warning(
+                "patch_result failed: %s %s — %s",
+                response.status_code,
+                url,
+                (response.text or "")[:500],
+            )
+            return False
+        except Exception as e:
+            logger.error("patch_result exception: %s", e)
+            return False
+
     def create_run(self, project_code: str, run_data: Dict[str, Any]) -> Optional[int]:
         """
         Create a test run using raw HTTP API.

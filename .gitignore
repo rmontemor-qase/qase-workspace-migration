@@ -38,6 +38,10 @@ mappings.json
 migration.log
 *.log
 
+# Migration debug traces (JSONL) — do not commit
+migration_trace.jsonl
+*_trace.jsonl
+
 # OS
 .DS_Store
 Thumbs.db

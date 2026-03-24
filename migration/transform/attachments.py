@@ -24,17 +24,18 @@ def extract_attachment_hashes_from_text(text: str) -> Set[str]:
     if not text or not isinstance(text, str):
         return set()
     
-    # Pattern to match markdown image links with attachment URLs
-    # Matches: ![filename](https://.../attachment/{HASH}/filename)
-    # The hash is typically 40 characters (SHA-1) but can vary
-    pattern = r'/attachment/([a-f0-9]{32,64})/'
-    
+    # /attachment/{hash}/ and /attachments/{hash}/; hash may be UUID (reporters, video/screenshot links)
+    pattern = (
+        r"/attachments?/"
+        r"([a-f0-9]{32,64}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})"
+        r"/"
+    )
+
     hashes = set()
     matches = re.findall(pattern, text, re.IGNORECASE)
     for match in matches:
-        # Normalize to lowercase for consistent storage
-        hashes.add(match.lower())
-    
+        hashes.add(str(match).replace("-", "").lower())
+
     return hashes
 
 
@@ -55,13 +56,18 @@ def extract_attachment_urls_from_text(text: str) -> Dict[str, str]:
     
     # Pattern to match full markdown image links: ![filename](URL)
     # Extract both the URL and hash
-    pattern = r'!\[[^\]]*\]\((https://[^\)]+/attachment/([a-f0-9]{32,64})/[^\)]+)\)'
-    
+    pattern = (
+        r'!\[[^\]]*\]\('
+        r'(https://[^\)]+/attachments?/'
+        r'([a-f0-9]{32,64}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})'
+        r'/[^\)]+)\)'
+    )
+
     url_map = {}
     matches = re.findall(pattern, text, re.IGNORECASE)
     for full_url, hash_match in matches:
-        url_map[hash_match] = full_url
-    
+        url_map[str(hash_match).replace("-", "").lower()] = full_url
+
     return url_map
 
 

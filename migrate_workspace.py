@@ -196,6 +196,24 @@ def main():
     
     mappings = MigrationMappings()
     stats = MigrationStats()
+
+    opts = config.get("options", {}) if config else {}
+    trace_file_cfg = opts.get("migration_trace_file", "migration_trace.jsonl")
+    if "migration_trace_file" in opts and opts["migration_trace_file"] in (False, None, ""):
+        trace_file_cfg = None
+    trace_full = bool(opts.get("migration_trace_full_payloads", False))
+    if trace_file_cfg:
+        from migration.trace_log import MigrationTrace
+
+        mappings.trace = MigrationTrace(str(trace_file_cfg), full_payloads=trace_full)
+        logger.info("Migration trace (JSONL): %s (full_payloads=%s)", trace_file_cfg, trace_full)
+        mappings.trace.event(
+            "migration_start",
+            source_host=args.source_host,
+            target_host=args.target_host,
+            mappings_file=args.mappings_file,
+            resume=args.resume,
+        )
     
     if args.resume:
         mappings.load_from_file(args.mappings_file)
@@ -305,6 +323,14 @@ def main():
         for project in projects:
             project_code_source = project['source_code']
             project_code_target = project['target_code']
+
+            tr = getattr(mappings, "trace", None)
+            if tr:
+                tr.event(
+                    "project_start",
+                    project_source=project_code_source,
+                    project_target=project_code_target,
+                )
             
             logger.info("\n" + "="*60)
             logger.info(f"Migrating project: {project_code_source} -> {project_code_target}")
@@ -483,22 +509,43 @@ def main():
                     project_stats[entity_type] = f"{created}/{processed}"
             for entity_type, count in project_stats.items():
                 logger.info(f"  {entity_type}: {count}")
+
+            if tr:
+                tr.event(
+                    "project_end",
+                    project_source=project_code_source,
+                    project_target=project_code_target,
+                    stats=project_stats,
+                )
         
         stats.print_summary()
         
         mappings.save_to_file(args.mappings_file)
         logger.info(f"\nMigration complete! Mappings saved to {args.mappings_file}")
+        if getattr(mappings, "trace", None):
+            mappings.trace.event("migration_complete", mappings_file=args.mappings_file)
         
     except KeyboardInterrupt:
         logger.warning("\nMigration interrupted by user")
         mappings.save_to_file(args.mappings_file)
         logger.info(f"Mappings saved to {args.mappings_file}. Use --resume to continue.")
+        if getattr(mappings, "trace", None):
+            mappings.trace.event("migration_interrupted")
         sys.exit(1)
     except Exception as e:
         logger.error(f"\nMigration failed with error: {e}", exc_info=True)
         mappings.save_to_file(args.mappings_file)
         logger.info(f"Mappings saved to {args.mappings_file}. Use --resume to continue.")
+        if getattr(mappings, "trace", None):
+            mappings.trace.event("migration_failed", error=str(e))
         sys.exit(1)
+    finally:
+        if getattr(mappings, "trace", None):
+            try:
+                mappings.trace.close()
+            except Exception:
+                pass
+            mappings.trace = None
 
 
 if __name__ == '__main__':
