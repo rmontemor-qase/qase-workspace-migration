@@ -2,8 +2,10 @@
 Extract attachment references from source Qase workspace.
 """
 import logging
+import os
 import re
-from typing import Dict, Set, List, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, Set, List, Any, Tuple
 from qase.api_client_v1.api.cases_api import CasesApi
 from qase.api_client_v1.api.runs_api import RunsApi
 from qase.api_client_v1.api.results_api import ResultsApi
@@ -362,28 +364,74 @@ def extract_attachment_hashes_from_defects(
     return all_hashes, url_map
 
 
+def _qase_service_kw(svc: QaseService) -> Dict[str, Any]:
+    return {
+        "api_token": svc.api_token,
+        "host": svc.host,
+        "ssl": svc.ssl,
+        "enterprise": svc.enterprise,
+        "scim_token": getattr(svc, "scim_token", None),
+        "scim_host": getattr(svc, "scim_host", None),
+    }
+
+
+def _extract_attachment_hashes_for_one_project(
+    source_kw: Dict[str, Any], project: Dict[str, Any]
+) -> Tuple[str, Tuple[Set[str], Dict[str, str]]]:
+    project_code_source = project["source_code"]
+    src = QaseService(**source_kw)
+    case_hashes, case_urls = extract_attachment_hashes_from_cases(src, project_code_source)
+    result_hashes, result_urls = extract_attachment_hashes_from_results(src, project_code_source)
+    defect_hashes, defect_urls = extract_attachment_hashes_from_defects(src, project_code_source)
+    all_hashes = case_hashes | result_hashes | defect_hashes
+    all_urls = {**case_urls, **result_urls, **defect_urls}
+    return project_code_source, (all_hashes, all_urls)
+
+
 def extract_all_attachment_hashes(
     source_service: QaseService,
-    projects: List[Dict[str, Any]]
+    projects: List[Dict[str, Any]],
+    max_project_workers: int = 0,
 ) -> Dict[str, tuple[Set[str], Dict[str, str]]]:
     """
     Extract all attachment hashes from all projects.
-    
+
+    max_project_workers: 0 = auto (min(8, len(projects), cpu)), 1 = sequential.
+
     Returns:
         Dictionary mapping project_code -> (set of hashes, dict of hash -> URL)
     """
+    if not projects:
+        return {}
+
+    if len(projects) == 1 or max_project_workers == 1:
+        all_project_attachments: Dict[str, tuple[Set[str], Dict[str, str]]] = {}
+        for project in projects:
+            project_code_source = project["source_code"]
+            case_hashes, case_urls = extract_attachment_hashes_from_cases(
+                source_service, project_code_source
+            )
+            result_hashes, result_urls = extract_attachment_hashes_from_results(
+                source_service, project_code_source
+            )
+            defect_hashes, defect_urls = extract_attachment_hashes_from_defects(
+                source_service, project_code_source
+            )
+            all_hashes = case_hashes | result_hashes | defect_hashes
+            all_urls = {**case_urls, **result_urls, **defect_urls}
+            all_project_attachments[project_code_source] = (all_hashes, all_urls)
+        return all_project_attachments
+
+    ncpu = os.cpu_count() or 4
+    workers = max_project_workers if max_project_workers > 1 else min(8, max(2, len(projects), ncpu))
+    workers = max(1, min(workers, len(projects)))
+    source_kw = _qase_service_kw(source_service)
     all_project_attachments = {}
-    
-    for project in projects:
-        project_code_source = project['source_code']
-        
-        case_hashes, case_urls = extract_attachment_hashes_from_cases(source_service, project_code_source)
-        result_hashes, result_urls = extract_attachment_hashes_from_results(source_service, project_code_source)
-        defect_hashes, defect_urls = extract_attachment_hashes_from_defects(source_service, project_code_source)
-        
-        all_hashes = case_hashes | result_hashes | defect_hashes
-        all_urls = {**case_urls, **result_urls, **defect_urls}
-        
-        all_project_attachments[project_code_source] = (all_hashes, all_urls)
-    
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(_extract_attachment_hashes_for_one_project, source_kw, p) for p in projects
+        ]
+        for fut in as_completed(futures):
+            code, payload = fut.result()
+            all_project_attachments[code] = payload
     return all_project_attachments

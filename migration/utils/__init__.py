@@ -33,7 +33,11 @@ if _parent_utils_path.exists():
         chunks = utils_module.chunks
         convert_uuids_to_strings = utils_module.convert_uuids_to_strings
         QaseRawApiClient = utils_module.QaseRawApiClient
-        
+        PARALLEL_PROJECT_MAPPING_ATTRS = utils_module.PARALLEL_PROJECT_MAPPING_ATTRS
+        fork_mappings_for_parallel_project = utils_module.fork_mappings_for_parallel_project
+        merge_parallel_project_into_main = utils_module.merge_parallel_project_into_main
+        merge_migration_stats = utils_module.merge_migration_stats
+
         __all__ = [
             'QaseScimClient',
             'MigrationMappings',
@@ -46,7 +50,11 @@ if _parent_utils_path.exists():
             'preserve_or_hash_id',
             'chunks',
             'convert_uuids_to_strings',
-            'QaseRawApiClient'
+            'QaseRawApiClient',
+            'PARALLEL_PROJECT_MAPPING_ATTRS',
+            'fork_mappings_for_parallel_project',
+            'merge_parallel_project_into_main',
+            'merge_migration_stats',
         ]
     else:
         # Fallback: only export SCIM client if utils.py can't be loaded

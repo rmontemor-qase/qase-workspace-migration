@@ -2,8 +2,8 @@
 Create attachments in target Qase workspace.
 """
 import logging
-import re
 import os
+import re
 import sys
 import time
 import base64
@@ -16,9 +16,11 @@ from typing import Dict, Set, List, Any, Optional, Tuple
 from tqdm import tqdm
 from qase.api_client_v1.api.attachments_api import AttachmentsApi
 from qase.api_client_v1.api.cases_api import CasesApi
+from qase.api_client_v1.exceptions import ApiException
 from qase_service import QaseService
 from migration.utils import MigrationMappings, MigrationStats, retry_with_backoff, extract_entities_from_response, to_dict
 from migration.extract.attachments import extract_all_attachment_hashes
+from migration.qase_rate_limit import QaseApiRateLimiter, exponential_backoff_delay
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +28,13 @@ logger = logging.getLogger(__name__)
 MAX_FILES_PER_UPLOAD = 20
 MAX_BYTES_PER_UPLOAD = 128 * 1024 * 1024
 MAX_BYTES_PER_FILE = 32 * 1024 * 1024
-DOWNLOAD_PARALLEL_WORKERS = 8
-_BULK_UPLOAD_RETRIES = 5
+# Qase cloud: ~1000 API req/min per account. Source and target each get their own rolling window.
+QASE_API_MAX_CALLS_PER_MINUTE = 1000
+DOWNLOAD_PARALLEL_WORKERS = min(24, max(8, (os.cpu_count() or 4) * 2))
+MAX_PARALLEL_TARGET_QUEUES = 4
+_BULK_UPLOAD_RETRIES = 12
+_ATTACHMENT_GET_MAX_RETRIES = 12
+_ATTACHMENT_GET_BASE_DELAY = 1.5
 
 
 def _try_download_markdown_url(
@@ -117,6 +124,7 @@ def _upload_files_http(
     project_code: str,
     named_files: List[Tuple[str, bytes]],
     mappings: MigrationMappings,
+    target_api_limiter: Optional[QaseApiRateLimiter] = None,
 ) -> List[Optional[str]]:
     """
     POST multipart file[] to /v1/attachment/{code}. Returns target hashes aligned with named_files.
@@ -135,12 +143,14 @@ def _upload_files_http(
     last_exc: Optional[Exception] = None
     for attempt in range(_BULK_UPLOAD_RETRIES):
         try:
+            if target_api_limiter:
+                target_api_limiter.acquire(1)
             r = requests.post(url, headers=headers, files=multipart, timeout=300)
             if r.status_code == 507:
                 logger.error("Attachment upload failed: insufficient storage (507) for project %s", project_code)
                 return [None] * n
             if r.status_code == 429 or r.status_code >= 500:
-                delay = 1.0 * (2**attempt)
+                delay = exponential_backoff_delay(attempt, base_delay=_ATTACHMENT_GET_BASE_DELAY)
                 logger.warning(
                     "Attachment upload HTTP %s, retry in %.1fs (%s/%s)",
                     r.status_code,
@@ -167,7 +177,7 @@ def _upload_files_http(
             return hashes
         except Exception as e:
             last_exc = e
-            delay = 1.0 * (2**attempt)
+            delay = exponential_backoff_delay(attempt, base_delay=_ATTACHMENT_GET_BASE_DELAY)
             logger.warning("Attachment upload error: %s; retry in %.1fs", e, delay)
             time.sleep(delay)
     if last_exc:
@@ -199,7 +209,11 @@ def _take_upload_batch(ready: deque) -> List[Tuple[str, str, bytes]]:
     return batch
 
 
-def _log_source_attachment_library_totals(source_service: QaseService, projects: List[Dict[str, Any]]) -> None:
+def _log_source_attachment_library_totals(
+    source_service: QaseService,
+    projects: List[Dict[str, Any]],
+    source_api_limiter: Optional[QaseApiRateLimiter] = None,
+) -> None:
     """Log result.total from GET /v1/attachment/{code} (no bulk download API in Qase)."""
     base = source_service.client.configuration.host.rstrip("/")
     headers = {"Token": source_service.api_token, "accept": "application/json"}
@@ -208,6 +222,8 @@ def _log_source_attachment_library_totals(source_service: QaseService, projects:
         if not code:
             continue
         try:
+            if source_api_limiter:
+                source_api_limiter.acquire(1)
             r = requests.get(
                 f"{base}/attachment/{code}",
                 headers=headers,
@@ -232,7 +248,8 @@ def _log_source_attachment_library_totals(source_service: QaseService, projects:
 
 def check_existing_attachments_in_target(
     target_service: QaseService,
-    projects: List[Dict[str, Any]]
+    projects: List[Dict[str, Any]],
+    target_api_limiter: Optional[QaseApiRateLimiter] = None,
 ) -> Set[str]:
     """
     Check for existing attachments in target workspace.
@@ -252,11 +269,20 @@ def check_existing_attachments_in_target(
             
             while True:
                 try:
+
+                    def _get_cases_page():
+                        if target_api_limiter:
+                            target_api_limiter.acquire(1)
+                        return cases_api_target.get_cases(
+                            code=project_code_target,
+                            limit=limit,
+                            offset=offset,
+                        )
+
                     cases_response = retry_with_backoff(
-                        cases_api_target.get_cases,
-                        code=project_code_target,
-                        limit=limit,
-                        offset=offset
+                        _get_cases_page,
+                        max_retries=8,
+                        base_delay=_ATTACHMENT_GET_BASE_DELAY,
                     )
                     
                     cases_entities = extract_entities_from_response(cases_response)
@@ -297,32 +323,70 @@ def download_attachment(
     attachments_api_source: AttachmentsApi,
     attachment_hash: str,
     markdown_url: Optional[str],
-    source_service: QaseService
+    source_service: QaseService,
+    *,
+    source_api_limiter: Optional[QaseApiRateLimiter] = None,
+    client_lock: Optional[threading.Lock] = None,
 ) -> Tuple[Optional[bytes], Optional[str]]:
     """
     Download attachment content and extract filename.
-    
+
     Returns:
         Tuple of (file_content, filename) or (None, None) if download fails
     """
     file_content = None
     filename = None
-    
+
     if markdown_url:
         parsed = urlparse(markdown_url)
         url_filename = os.path.basename(parsed.path)
-        if url_filename and url_filename != '/':
+        if url_filename and url_filename != "/":
             filename = url_filename
-    
+
     download_response = None
-    try:
-        download_response = retry_with_backoff(
-            attachments_api_source.get_attachment,
-            hash=attachment_hash
-        )
-    except Exception as api_error:
-        pass
-    
+    for attempt in range(_ATTACHMENT_GET_MAX_RETRIES):
+        try:
+
+            def _do_get():
+                if source_api_limiter:
+                    source_api_limiter.acquire(1)
+                return attachments_api_source.get_attachment(hash=attachment_hash)
+
+            if client_lock is not None:
+                with client_lock:
+                    download_response = _do_get()
+            else:
+                download_response = _do_get()
+            break
+        except ApiException as e:
+            if e.status == 404:
+                download_response = None
+                break
+            if e.status == 429 or (e.status is not None and e.status >= 500):
+                if attempt < _ATTACHMENT_GET_MAX_RETRIES - 1:
+                    delay = exponential_backoff_delay(attempt, base_delay=_ATTACHMENT_GET_BASE_DELAY)
+                    logger.warning(
+                        "get_attachment %s HTTP %s, backoff %.1fs (%s/%s)",
+                        attachment_hash[:12],
+                        e.status,
+                        delay,
+                        attempt + 1,
+                        _ATTACHMENT_GET_MAX_RETRIES,
+                    )
+                    time.sleep(delay)
+                    continue
+            logger.debug("get_attachment failed for %s: %s", attachment_hash[:12], e)
+            download_response = None
+            break
+        except Exception as api_error:
+            if attempt < _ATTACHMENT_GET_MAX_RETRIES - 1:
+                delay = exponential_backoff_delay(attempt, base_delay=_ATTACHMENT_GET_BASE_DELAY)
+                time.sleep(delay)
+                continue
+            logger.debug("get_attachment error for %s: %s", attachment_hash[:12], api_error)
+            download_response = None
+            break
+
     if download_response and hasattr(download_response, 'status') and download_response.status:
         if hasattr(download_response, 'result') and download_response.result:
             attachment_obj = download_response.result
@@ -400,6 +464,7 @@ def upload_attachment(
     filename: str,
     file_content: bytes,
     mappings: MigrationMappings,
+    target_api_limiter: Optional[QaseApiRateLimiter] = None,
 ) -> Optional[str]:
     """
     Upload a single attachment via HTTP multipart (same endpoint as bulk).
@@ -408,7 +473,11 @@ def upload_attachment(
         Target attachment hash, or None if upload fails
     """
     hashes = _upload_files_http(
-        target_service, project_code_target, [(filename, file_content)], mappings
+        target_service,
+        project_code_target,
+        [(filename, file_content)],
+        mappings,
+        target_api_limiter=target_api_limiter,
     )
     return hashes[0] if hashes else None
 
@@ -419,18 +488,23 @@ def _download_single_for_migration(
     attachments_api_source: AttachmentsApi,
     source_service: QaseService,
     sdk_lock: threading.Lock,
+    source_api_limiter: Optional[QaseApiRateLimiter] = None,
 ) -> Tuple[str, Optional[bytes], Optional[str]]:
-    """Try public URL first (parallel-friendly), then SDK get_attachment under lock."""
+    """Try public URL first (parallel-friendly), then SDK get_attachment (throttled, short lock)."""
     if markdown_url:
         content, filename = _try_download_markdown_url(
             markdown_url, attachment_hash, source_service
         )
         if content and filename:
             return attachment_hash, content, filename
-    with sdk_lock:
-        content, filename = download_attachment(
-            attachments_api_source, attachment_hash, markdown_url, source_service
-        )
+    content, filename = download_attachment(
+        attachments_api_source,
+        attachment_hash,
+        markdown_url,
+        source_service,
+        source_api_limiter=source_api_limiter,
+        client_lock=sdk_lock,
+    )
     return attachment_hash, content, filename
 
 
@@ -439,6 +513,7 @@ def _download_batch_parallel(
     attachments_api_source: AttachmentsApi,
     source_service: QaseService,
     sdk_lock: threading.Lock,
+    source_api_limiter: Optional[QaseApiRateLimiter] = None,
 ) -> List[Tuple[str, str, bytes]]:
     if not batch:
         return []
@@ -446,7 +521,7 @@ def _download_batch_parallel(
     if len(batch) == 1:
         h, url = batch[0]
         _, content, filename = _download_single_for_migration(
-            h, url, attachments_api_source, source_service, sdk_lock
+            h, url, attachments_api_source, source_service, sdk_lock, source_api_limiter
         )
         if content and filename:
             out.append((h, filename, content))
@@ -461,6 +536,7 @@ def _download_batch_parallel(
                 attachments_api_source,
                 source_service,
                 sdk_lock,
+                source_api_limiter,
             ): h
             for h, url in batch
         }
@@ -495,8 +571,12 @@ def migrate_attachments_workspace(
         Dictionary mapping project_code -> {source_hash -> target_hash}
     """
     attachments_api_source = AttachmentsApi(source_service.client)
+    source_api_limiter = QaseApiRateLimiter(QASE_API_MAX_CALLS_PER_MINUTE, 60.0)
+    target_api_limiter = QaseApiRateLimiter(QASE_API_MAX_CALLS_PER_MINUTE, 60.0)
 
-    existing_attachments = check_existing_attachments_in_target(target_service, projects)
+    existing_attachments = check_existing_attachments_in_target(
+        target_service, projects, target_api_limiter=target_api_limiter
+    )
 
     all_project_attachments = extract_all_attachment_hashes(source_service, projects)
 
@@ -516,7 +596,9 @@ def migrate_attachments_workspace(
     skipped_existing_count = 0
     skipped_already_migrated_count = 0
 
-    _log_source_attachment_library_totals(source_service, projects)
+    _log_source_attachment_library_totals(
+        source_service, projects, source_api_limiter=source_api_limiter
+    )
 
     upload_queues: Dict[str, deque] = defaultdict(deque)
     work_total = 0
@@ -563,6 +645,8 @@ def migrate_attachments_workspace(
         work_total += 1
 
     sdk_lock = threading.Lock()
+    mapping_lock = threading.Lock()
+    pbar_lock = threading.Lock()
     pbar = tqdm(
         total=work_total,
         desc="Migrating attachments",
@@ -571,52 +655,84 @@ def migrate_attachments_workspace(
         dynamic_ncols=True,
     )
 
-    try:
-        for target_code in sorted(upload_queues.keys()):
-            q = upload_queues[target_code]
-            ready: deque = deque()
-            while q or ready:
-                while len(ready) < MAX_FILES_PER_UPLOAD * 3 and q:
-                    download_batch: List[Tuple[str, Optional[str]]] = []
-                    while len(download_batch) < MAX_FILES_PER_UPLOAD and q:
-                        download_batch.append(q.popleft())
-                    downloaded = _download_batch_parallel(
-                        download_batch, attachments_api_source, source_service, sdk_lock
-                    )
-                    ok_hashes = {t[0] for t in downloaded}
-                    for h, _url in download_batch:
-                        if h not in ok_hashes:
-                            pbar.update(1)
-                    for triple in downloaded:
-                        ready.append(triple)
-                if not ready:
-                    break
-                upload_batch = _take_upload_batch(ready)
-                if not upload_batch:
-                    continue
-                named_files = [(fn, content) for _h, fn, content in upload_batch]
-                target_hashes = _upload_files_http(
-                    target_service, target_code, named_files, mappings
+    def _pbar_update(n: int = 1) -> None:
+        with pbar_lock:
+            pbar.update(n)
+
+    def drain_target_queue(target_code: str) -> int:
+        local_migrated = 0
+        q = upload_queues[target_code]
+        ready: deque = deque()
+        while q or ready:
+            while len(ready) < MAX_FILES_PER_UPLOAD * 3 and q:
+                download_batch: List[Tuple[str, Optional[str]]] = []
+                while len(download_batch) < MAX_FILES_PER_UPLOAD and q:
+                    download_batch.append(q.popleft())
+                downloaded = _download_batch_parallel(
+                    download_batch,
+                    attachments_api_source,
+                    source_service,
+                    sdk_lock,
+                    source_api_limiter,
                 )
-                if (
-                    len(upload_batch) > 1
-                    and target_hashes
-                    and all(th is None for th in target_hashes)
-                ):
-                    for src_hash, fn, content in upload_batch:
-                        th = _upload_files_http(target_service, target_code, [(fn, content)], mappings)
-                        mapped = th[0] if th else None
-                        if mapped:
+                ok_hashes = {t[0] for t in downloaded}
+                for h, _url in download_batch:
+                    if h not in ok_hashes:
+                        _pbar_update(1)
+                for triple in downloaded:
+                    ready.append(triple)
+            if not ready:
+                break
+            upload_batch = _take_upload_batch(ready)
+            if not upload_batch:
+                continue
+            named_files = [(fn, content) for _h, fn, content in upload_batch]
+            target_hashes = _upload_files_http(
+                target_service,
+                target_code,
+                named_files,
+                mappings,
+                target_api_limiter=target_api_limiter,
+            )
+            if (
+                len(upload_batch) > 1
+                and target_hashes
+                and all(th is None for th in target_hashes)
+            ):
+                for src_hash, fn, content in upload_batch:
+                    th = _upload_files_http(
+                        target_service,
+                        target_code,
+                        [(fn, content)],
+                        mappings,
+                        target_api_limiter=target_api_limiter,
+                    )
+                    mapped = th[0] if th else None
+                    if mapped:
+                        with mapping_lock:
                             global_attachment_mapping[src_hash] = mapped
-                            migrated_count += 1
-                        pbar.update(1)
-                    continue
-                for i, (src_hash, _fn, _c) in enumerate(upload_batch):
-                    th = target_hashes[i] if i < len(target_hashes) else None
-                    if th:
+                        local_migrated += 1
+                    _pbar_update(1)
+                continue
+            for i, (src_hash, _fn, _c) in enumerate(upload_batch):
+                th = target_hashes[i] if i < len(target_hashes) else None
+                if th:
+                    with mapping_lock:
                         global_attachment_mapping[src_hash] = th
-                        migrated_count += 1
-                    pbar.update(1)
+                    local_migrated += 1
+                _pbar_update(1)
+        return local_migrated
+
+    try:
+        targets_with_work = [tc for tc in sorted(upload_queues.keys()) if upload_queues[tc]]
+        if targets_with_work:
+            n_workers = min(MAX_PARALLEL_TARGET_QUEUES, len(targets_with_work))
+            with ThreadPoolExecutor(max_workers=n_workers) as upload_pool:
+                futures = [
+                    upload_pool.submit(drain_target_queue, tc) for tc in targets_with_work
+                ]
+                for fut in as_completed(futures):
+                    migrated_count += fut.result()
     finally:
         pbar.close()
     

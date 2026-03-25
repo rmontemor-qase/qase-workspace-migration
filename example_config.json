@@ -28,6 +28,8 @@
     "preserve_ids": true,
     "mappings_file": "mappings.json",
     "skip_projects": [],
-    "only_projects": ["ECSE", "DIS", "TDS"]
+    "only_projects": ["ECSE", "DIS", "TDS"],
+    "parallel_project_migration": true,
+    "max_parallel_projects": 4
   }
 }

@@ -3,6 +3,7 @@ Migration utilities - Helper functions for data processing, ID mapping, and erro
 """
 import json
 import logging
+import threading
 import time
 import hashlib
 import uuid
@@ -123,29 +124,34 @@ class MigrationMappings:
 
 
 class MigrationStats:
-    """Tracks migration statistics."""
-    
+    """Tracks migration statistics (thread-safe for parallel project workers)."""
+
     def __init__(self):
         self.entities_processed = {}
         self.entities_created = {}
         self.errors = []
-    
+        self._lock = threading.Lock()
+
     def add_entity(self, entity_type: str, source_count: int, target_count: int):
         """Record entity migration stats. Accumulates counts across multiple calls."""
-        if entity_type in self.entities_processed:
-            self.entities_processed[entity_type] += source_count
-            self.entities_created[entity_type] += target_count
-        else:
-            self.entities_processed[entity_type] = source_count
-            self.entities_created[entity_type] = target_count
-    
+        with self._lock:
+            if entity_type in self.entities_processed:
+                self.entities_processed[entity_type] += source_count
+                self.entities_created[entity_type] += target_count
+            else:
+                self.entities_processed[entity_type] = source_count
+                self.entities_created[entity_type] = target_count
+
     def add_error(self, entity_type: str, error: str):
         """Record an error."""
-        self.errors.append({
-            'entity_type': entity_type,
-            'error': error,
-            'timestamp': datetime.now().isoformat()
-        })
+        with self._lock:
+            self.errors.append(
+                {
+                    "entity_type": entity_type,
+                    "error": error,
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
     
     def print_summary(self):
         """Print migration summary."""
@@ -162,6 +168,60 @@ class MigrationStats:
             for error in self.errors[:10]:
                 print(f"  - {error['entity_type']}: {error['error']}")
         print("="*60 + "\n")
+
+
+# Per-project keys merged back into main mappings after parallel workers finish.
+PARALLEL_PROJECT_MAPPING_ATTRS = (
+    "milestones",
+    "configurations",
+    "configuration_groups",
+    "environments",
+    "shared_steps",
+    "suites",
+    "cases",
+    "plans",
+    "runs",
+    "result_hashes",
+    "defects",
+)
+
+
+def fork_mappings_for_parallel_project(base: "MigrationMappings") -> "MigrationMappings":
+    """
+    Shallow fork for a parallel worker: share read-only workspace-level dicts;
+    project-specific buckets start empty on the fork (filled during the worker).
+    """
+    m = MigrationMappings()
+    m.users = base.users
+    m.user_email_mapping = base.user_email_mapping
+    m.user_uuid_mapping = base.user_uuid_mapping
+    m.author_uuid_to_id_mapping = base.author_uuid_to_id_mapping
+    m.custom_fields = base.custom_fields
+    m.shared_parameters = base.shared_parameters
+    m.attachments = base.attachments
+    m.projects = base.projects
+    m.target_workspace_hash = base.target_workspace_hash
+    m.trace = base.trace
+    return m
+
+
+def merge_parallel_project_into_main(
+    main: "MigrationMappings", worker: "MigrationMappings", project_source: str
+) -> None:
+    """Copy this project's mapping slices from worker into main (main thread)."""
+    for attr in PARALLEL_PROJECT_MAPPING_ATTRS:
+        wmap = getattr(worker, attr)
+        if project_source in wmap:
+            getattr(main, attr)[project_source] = wmap[project_source]
+
+
+def merge_migration_stats(dst: "MigrationStats", src: "MigrationStats") -> None:
+    """Accumulate worker stats into dst (call from main thread after each worker)."""
+    for et, proc in src.entities_processed.items():
+        cre = src.entities_created.get(et, 0)
+        dst.add_entity(et, proc, cre)
+    for err in src.errors:
+        dst.add_error(err["entity_type"], err["error"])
 
 
 MAX_SAFE_ID = 2**31 - 1

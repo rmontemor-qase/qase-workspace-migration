@@ -1,17 +1,64 @@
 # Qase Workspace Migration Tool
 
-A comprehensive Python script for migrating all content from one Qase workspace to another, preserving structure, links, attachments, and relationships.
+A Python tool for migrating **supported** Qase workspace data from a source workspace to a target workspace, preserving structure, links, attachments, and relationships **within the limits of the public API** (see [included scope](#what-this-tool-migrates-included-scope) and [limitations](#what-is-not-included-known-limitations)).
 
 ## Features
 
-- ✅ **Complete Migration**: Migrates projects, suites, test cases, runs, results, attachments, milestones, configurations, shared steps, custom fields, and users
-- ✅ **Preserves Structure**: Maintains hierarchical relationships (suites, milestones)
-- ✅ **Preserves Links**: Maintains relationships between entities (cases to suites, runs to cases, etc.)
-- ✅ **Preserves Attachments**: Migrates attachments and maintains references
-- ✅ **ID Mapping**: Optionally preserves entity IDs or generates new ones
-- ✅ **Resume Capability**: Can resume interrupted migrations
-- ✅ **Error Handling**: Robust error handling with retry logic
-- ✅ **Progress Tracking**: Detailed logging and statistics
+- ✅ **Core test data**: Migrates projects and the main test-artifact graph (suites, cases, plans, runs, results) plus supporting entities where the public API allows (see below)
+- ✅ **Preserves structure**: Hierarchical relationships (suites, milestones) within what is migrated
+- ✅ **Preserves links**: Relationships between migrated entities (e.g. cases to suites, runs to cases) within API limits
+- ✅ **Attachments**: Migrates attachments when referenced; see limitations for edge cases
+- ✅ **ID mapping**: Optionally preserves entity IDs or generates new ones (`--preserve-ids`)
+- ✅ **Resume**: Can resume interrupted migrations from saved mappings
+- ✅ **Resilience**: Retry logic for rate limits; detailed logging and statistics
+
+## What this tool migrates (included scope)
+
+The orchestrator in `migrate_workspace.py` is built to migrate the following **when exposed and writable through the public API**:
+
+| Area | What the script targets |
+|------|-------------------------|
+| **Projects** | Projects from source to target (with filters such as `--only-projects`, `--skip-projects`, `--only-active`) |
+| **People & access helpers** | Optional user migration and group mapping (config-driven; see `example_config.json`) |
+| **Fields & parameters** | Custom fields and shared parameters (migrated at workspace level in the orchestrator, scoped to selected projects) |
+| **Attachments** | Workspace-level attachment pass, then per-project use when migrating defects |
+| **Planning & structure** | Milestones (hierarchical), configuration groups and configurations, environments |
+| **Shared steps** | Project-scoped shared steps **where the API supports create/read** (workspace-level shared step libraries are not covered; see limitations) |
+| **Tests** | Suites (hierarchical), test cases, test plans, test runs, test results |
+| **Defects** | Defect records are migrated in a **limited** way (see limitations: linking to runs/results may be incomplete) |
+
+Anything not listed above, or called out in [What is not included](#what-is-not-included-known-limitations), is outside the intended scope of this tool or is blocked by current public API capabilities.
+
+## What is not included (known limitations)
+
+The following gaps reflect **current public API limitations** and product areas this script does not migrate end-to-end. Treat this as the source of truth for planning a workspace move; the script may still *attempt* some related calls where code exists, but you should not rely on full parity for the items below.
+
+### Workspace level
+
+| Item | Notes |
+|------|--------|
+| **Roles** | Workspace role definitions and assignments are not migrated via the public API. |
+| **Shared steps** | Workspace-level shared step libraries / assets are not covered. |
+| **Dashboards** | Dashboards are not migrated. |
+| **Queries** | Saved queries are not migrated. |
+
+### Project level
+
+| Item | Notes |
+|------|--------|
+| **Test cases in review** | Cases in review workflow states are not handled as a complete migration path. |
+| **Traceability reports** | Traceability report configuration and data are not migrated. |
+| **Aiden Test Converter converted tests** | Tests produced or managed by Aiden Test Converter are not migrated by this tool. |
+| **Aiden authorization settings** | Aiden-related authorization settings are not migrated. |
+| **Requirements** | Requirements (and their links) are not migrated. |
+| **Project settings** | General project settings beyond what the API exposes for the entities we migrate are not replicated. |
+
+### Additional limitations
+
+| Item | Notes |
+|------|--------|
+| **Defects** | You can create and resolve defects in principle, but **linking defects to runs and results** is not fully supported through the public API in a way this migration guarantees. Plan for manual verification or follow-up linking in the target workspace. |
+| **Integrations** | Integrations (e.g. Jira) are not migrated as a turnkey handoff. During cutover you may need a **separate process** to re-point Jira (or other tools) from the old workspace to the new one and to preserve or recreate integration metadata the API does not carry over. |
 
 ## Installation
 
@@ -53,7 +100,7 @@ python migrate_workspace.py --config config.json
 
 ### Basic Migration (Command Line)
 
-Migrate all content from source to target workspace:
+Migrate supported project data from source to target workspace:
 
 ```bash
 python migrate_workspace.py \
@@ -157,18 +204,26 @@ python migrate_workspace.py \
 
 ## Migration Order
 
-The script migrates entities in the following order to respect dependencies:
+Within [the included scope](#what-this-tool-migrates-included-scope), the script migrates entities in this order so dependencies stay consistent. Steps marked **(workspace)** run once for the migration; the rest run **per project**.
 
-1. **Projects** - Foundation entities
-2. **Users** - Map users by email
-3. **Custom Fields** - Per project
-4. **Milestones** - Per project (hierarchical)
-5. **Configurations** - Per project (groups and configs)
-6. **Shared Steps** - Per project
-7. **Suites** - Per project (hierarchical)
-8. **Test Cases** - Per project
-9. **Test Runs** - Per project
-10. **Test Results** - Per run
+1. **Projects** — Foundation entities  
+2. **Users** — Optional **(workspace)**; map users by email when enabled in config  
+3. **Groups** — Optional **(workspace)**; after users when enabled  
+4. **Custom fields** — **(workspace)** pass over selected projects  
+5. **Shared parameters** — **(workspace)** pass over selected projects  
+6. **Attachments** — **(workspace)** pass; attachments are also applied when migrating cases, results, and defects  
+7. **Milestones** — Per project (hierarchical)  
+8. **Configurations** — Per project (groups and configs)  
+9. **Environments** — Per project  
+10. **Shared steps** — Per project (subject to [workspace/API limits](#what-is-not-included-known-limitations))  
+11. **Suites** — Per project (hierarchical)  
+12. **Test cases** — Per project (cases in review and other excluded items still apply)  
+13. **Test plans** — Per project  
+14. **Test runs** — Per project  
+15. **Test results** — Per run  
+16. **Defects** — Per project (partial; see [defects limitation](#additional-limitations))  
+
+Steps that are skipped via config (e.g. users) are omitted at runtime.
 
 ## Output Files
 
@@ -201,10 +256,10 @@ The script includes retry logic with exponential backoff for rate limiting. For 
 - Large attachments may take time to migrate
 - Attachment references are preserved in text fields
 
-### Shared Steps
+### Shared steps
 
-- Cases with shared steps use raw HTTP API (bypasses SDK validation)
-- Shared steps must be migrated before cases that reference them
+- At **project** scope, the script migrates shared steps before cases that reference them (implementation may use raw HTTP where the SDK is too strict).
+- **Workspace-level** shared step libraries are **not** in scope; see [Workspace level](#workspace-level) under limitations.
 
 ## Troubleshooting
 
