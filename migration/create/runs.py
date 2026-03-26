@@ -2,12 +2,12 @@
 Create runs in target Qase workspace.
 """
 import logging
-from typing import Dict, Any
+from typing import Any, Dict
 from qase.api_client_v1.api.runs_api import RunsApi
 from qase.api_client_v1.models import RunCreate
 from qase_service import QaseService
 from migration.utils import MigrationMappings, MigrationStats, retry_with_backoff, format_datetime, QaseRawApiClient
-from migration.extract.runs import extract_runs, extract_run_cases
+from migration.extract.runs import extract_runs, extract_run_cases, fetch_run_detail_json
 from migration.trace_log import summarize_source_run
 
 logger = logging.getLogger(__name__)
@@ -16,18 +16,49 @@ logger = logging.getLogger(__name__)
 def _source_run_should_complete_after_results(run_dict: Dict[str, Any]) -> bool:
     """
     Queue complete_run after results migration when the source run was already finished.
-    Raw run list payloads vary: is_completed, end_time, state/status strings, etc.
+    List and detail payloads differ; check booleans, timestamps, and string/enum shapes.
     """
+    if not run_dict:
+        return False
     if run_dict.get("is_completed") or run_dict.get("is_complete"):
         return True
-    if run_dict.get("end_time"):
-        return True
-    for key in ("state", "status"):
+    for k in (
+        "end_time",
+        "completed_at",
+        "time_end",
+        "finished_at",
+        "closed_at",
+        "complete_time",
+    ):
+        if run_dict.get(k):
+            return True
+    for key in ("state", "status", "run_status", "runStatus", "execution_state", "executionState"):
         raw = run_dict.get(key)
         if isinstance(raw, str):
             s = raw.strip().lower()
-            if s in ("completed", "complete", "finished", "done", "closed", "aborted"):
+            if s in (
+                "completed",
+                "complete",
+                "finished",
+                "done",
+                "closed",
+                "aborted",
+                "ended",
+            ):
                 return True
+        elif isinstance(raw, dict):
+            for nk in ("title", "name", "status", "slug", "value"):
+                v = raw.get(nk)
+                if isinstance(v, str) and v.strip().lower() in (
+                    "completed",
+                    "complete",
+                    "finished",
+                    "done",
+                    "closed",
+                    "aborted",
+                    "ended",
+                ):
+                    return True
     return False
 
 
@@ -264,15 +295,32 @@ def migrate_runs(
         
         if create_response and target_run_id:
             run_mapping[source_run_id] = target_run_id
-            should_complete = _source_run_should_complete_after_results(run_dict)
+            flag_src: Dict[str, Any] = run_dict
+            should_complete = _source_run_should_complete_after_results(flag_src)
+            if not should_complete and source_run_id is not None:
+                try:
+                    detail = fetch_run_detail_json(
+                        source_service, project_code_source, int(source_run_id)
+                    )
+                    if detail and _source_run_should_complete_after_results(detail):
+                        should_complete = True
+                        flag_src = detail
+                except Exception:
+                    pass
             if should_complete:
                 if not hasattr(migrate_runs, '_runs_to_complete'):
                     migrate_runs._runs_to_complete = {}
                 migrate_runs._runs_to_complete[target_run_id] = {
                     'project_code': project_code_target,
                     'is_completed': True,
-                    'source_is_completed': bool(run_dict.get('is_completed') or run_dict.get('is_complete')),
-                    'has_end_time': bool(run_dict.get('end_time')),
+                    'source_is_completed': bool(
+                        flag_src.get("is_completed") or flag_src.get("is_complete")
+                    ),
+                    'has_end_time': bool(
+                        flag_src.get("end_time")
+                        or flag_src.get("time_end")
+                        or flag_src.get("completed_at")
+                    ),
                 }
             if trace:
                 trace.event(

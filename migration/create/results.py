@@ -2,21 +2,33 @@
 Create results in target Qase workspace using API v2 bulk create.
 
 V1 bulk + PATCH does not reliably persist comments, step actuals, or attachments.
-V2 POST /{project}/run/{id}/results matches the shape used by the Xray → Qase migrator:
-ResultCreate with testops_id, execution, message, attachments, and ResultStep with
-data (action / expected_result) + execution.comment for actual output.
+V2 POST /{project}/run/{id}/results uses ResultCreate with execution, message,
+attachments, and ResultStep data.
+
+Mapped results use ``testops_id``. Unmapped automated results omit ``testops_id`` and
+use ``fields`` / ``relations`` only (no v1 case bulk create — avoids filling the
+repository when "create cases from automated results" is off).
+
+Titles use whatever the result/detail payload already includes; otherwise use
+``Automated Test {id}`` (source ``case_id``, result ``id``, mapped target id, or hash
+prefix). ``relations.suite`` mirrors the source case suite path
+when the API exposes it (e.g. ``suite_title`` or ``suite``).
 """
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from qase.api_client_v2.api.results_api import ResultsApi
 from qase.api_client_v1.exceptions import ApiException
 from qase.api_client_v2.exceptions import ApiException as ApiExceptionV2
 from qase.api_client_v2.models.create_results_request_v2 import CreateResultsRequestV2
 from qase.api_client_v2.models.result_create import ResultCreate
+from qase.api_client_v2.models.result_create_fields import ResultCreateFields
 from qase.api_client_v2.models.result_execution import ResultExecution
+from qase.api_client_v2.models.result_relations import ResultRelations
+from qase.api_client_v2.models.relation_suite import RelationSuite
+from qase.api_client_v2.models.relation_suite_item import RelationSuiteItem
 from qase.api_client_v2.models.result_step import ResultStep
 from qase.api_client_v2.models.result_step_data import ResultStepData
 from qase.api_client_v2.models.result_step_execution import ResultStepExecution
@@ -27,7 +39,9 @@ from qase.api_client_v1.api.cases_api import CasesApi
 from qase_service import QaseService
 from migration.utils import MigrationMappings, MigrationStats, chunks, to_dict
 from migration.extract.results import extract_results, fetch_result_detail_json
+from migration.extract.runs import fetch_run_detail_json
 from migration.extract.authors import extract_authors
+from migration.create.runs import _source_run_should_complete_after_results
 from migration.transform.attachments import replace_attachment_hashes_in_text
 from migration.trace_log import (
     chunk_results_payload_for_trace,
@@ -350,6 +364,13 @@ def _merge_result_detail_into_summary(summary: Dict[str, Any], detail: Dict[str,
         "screenshots",
         "media",
         "images",
+        "params",
+        "param",
+        "param_groups",
+        "parameters",
+        "signature",
+        "suite_title",
+        "suiteTitle",
     ):
         if k not in detail:
             continue
@@ -434,6 +455,33 @@ def _merge_result_steps_with_case_steps(
     return out
 
 
+def _suite_path_titles_from_case_dict(cd: Dict[str, Any]) -> List[str]:
+    """Build root→leaf suite titles for v2 ``relations.suite`` when present on case JSON."""
+    st = cd.get("suite_title") or cd.get("suiteTitle")
+    if isinstance(st, str) and st.strip():
+        parts = [x.strip() for x in re.split(r"[\t\n\r]+", st) if x.strip()]
+        if parts:
+            return parts
+    su = cd.get("suite")
+    if isinstance(su, dict):
+        t = _pick_str(su, "title", "Title", "name", "Name")
+        if t:
+            return [t]
+    nested = cd.get("suites")
+    if isinstance(nested, list) and nested:
+        out: List[str] = []
+        for item in nested:
+            if isinstance(item, dict):
+                t = _pick_str(item, "title", "Title", "name", "Name")
+                if t:
+                    out.append(t)
+            elif isinstance(item, str) and item.strip():
+                out.append(item.strip())
+        if out:
+            return out
+    return []
+
+
 def _fetch_source_case_metadata(
     source_service: QaseService,
     project_code: str,
@@ -443,16 +491,14 @@ def _fetch_source_case_metadata(
     Single get_case for source workspace. Does not use retry_with_backoff so 404s stay quiet
     (deleted / missing cases still appear in old run results).
     """
-    meta: Dict[str, Any] = {"steps": [], "title": None}
+    meta: Dict[str, Any] = {"steps": [], "suite_path_titles": []}
     try:
         cases_api = CasesApi(source_service.client)
         resp = cases_api.get_case(code=project_code, id=case_id)
         if resp and getattr(resp, "result", None):
             cd = to_dict(resp.result)
             meta["steps"] = cd.get("steps") or []
-            t = _pick_str(cd, "title", "Title", "name", "Name")
-            if t:
-                meta["title"] = t
+            meta["suite_path_titles"] = _suite_path_titles_from_case_dict(cd)
     except ApiException as e:
         if e.status == 404:
             logger.debug(
@@ -495,6 +541,19 @@ def enrich_source_result_for_v2(
 
     out = _merge_result_top_level_execution(out)
 
+    if not out.get("_source_suite_path_titles"):
+        spt = _suite_path_titles_from_case_dict(out)
+        if spt:
+            out["_source_suite_path_titles"] = spt
+    if not out.get("_source_suite_path_titles"):
+        for ck in ("case", "test_case", "Case", "testCase"):
+            c = out.get(ck)
+            if isinstance(c, dict):
+                spt = _suite_path_titles_from_case_dict(to_dict(c))
+                if spt:
+                    out["_source_suite_path_titles"] = spt
+                    break
+
     steps_list = _iter_result_steps(out)
     sid = out.get("case_id")
     if sid is not None:
@@ -505,8 +564,9 @@ def enrich_source_result_for_v2(
         if cid is not None:
             meta = _get_source_case_cached(case_steps_cache, source_service, project_code, cid)
             case_steps = meta.get("steps") or []
-            if meta.get("title") and not _pick_str(out, "title", "Title", "case_title", "caseTitle", "name", "Name"):
-                out["_resolved_case_title"] = meta["title"]
+            spt = meta.get("suite_path_titles") or []
+            if isinstance(spt, list) and spt:
+                out["_source_suite_path_titles"] = spt
             if case_steps:
                 merged = _merge_result_steps_with_case_steps(
                     steps_list or [],
@@ -725,8 +785,202 @@ def _build_v2_step(
     return ResultStep(data=data, execution=execution)
 
 
-def _resolve_result_display_title(result_dict: Dict[str, Any], target_case_id: int) -> str:
-    """Qase run result list/detail often omit `title`; use case blob, case_title, or cache."""
+def _coerce_str_params_map(d: Dict[str, Any]) -> Dict[str, str]:
+    return {str(k): "" if v is None else str(v) for k, v in d.items()}
+
+
+def _params_dict_from_list_items(items: List[Any]) -> Optional[Dict[str, str]]:
+    acc: Dict[str, str] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = _pick_str(
+            item,
+            "title",
+            "Title",
+            "name",
+            "Name",
+            "key",
+            "Key",
+            "parameter",
+            "Parameter",
+        )
+        if not name:
+            continue
+        val = item.get("value")
+        if val is None:
+            val = item.get("Value")
+        if val is None:
+            val = _pick_str(
+                item,
+                "selected",
+                "Selected",
+                "selected_value",
+                "selectedValue",
+            )
+        acc[name] = "" if val is None else str(val)
+    return acc if acc else None
+
+
+def _normalize_param_groups_v1(raw: Any) -> Optional[List[List[str]]]:
+    if not isinstance(raw, list) or not raw:
+        return None
+    out: List[List[str]] = []
+    for g in raw:
+        if isinstance(g, str):
+            s = g.strip()
+            if s:
+                out.append([s])
+        elif isinstance(g, list):
+            inner = [str(x) for x in g if x is not None and str(x).strip() != ""]
+            if inner:
+                out.append(inner)
+        elif isinstance(g, dict):
+            gd = to_dict(g)
+            titles: List[str] = []
+            for it in gd.get("parameters") or gd.get("items") or []:
+                if isinstance(it, dict):
+                    t = _pick_str(it, "title", "Title", "name", "Name")
+                    if t:
+                        titles.append(t)
+            if titles:
+                out.append(titles)
+    return out or None
+
+
+def _extract_v2_params_from_result(
+    result_dict: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, str]], Optional[List[List[str]]]]:
+    """
+    Map v1 result payloads to v2 params / param_groups.
+    Covers `params` vs `param`, nested case, execution, and list-shaped `parameters`.
+    """
+    str_params: Optional[Dict[str, str]] = None
+    groups_raw: Any = result_dict.get("param_groups")
+
+    def take_from_mapping(m: Dict[str, Any]) -> None:
+        nonlocal str_params, groups_raw
+        if groups_raw is None:
+            groups_raw = m.get("param_groups")
+        if str_params is not None:
+            return
+        for key in ("params", "param"):
+            v = m.get(key)
+            if isinstance(v, dict) and v:
+                str_params = _coerce_str_params_map(v)
+                return
+            if isinstance(v, list) and v:
+                str_params = _params_dict_from_list_items(v)
+                return
+        pl = m.get("parameters")
+        if isinstance(pl, list) and pl:
+            str_params = _params_dict_from_list_items(pl)
+
+    take_from_mapping(result_dict)
+
+    if str_params is None:
+        ex = result_dict.get("execution")
+        if isinstance(ex, dict):
+            take_from_mapping(to_dict(ex))
+
+    if str_params is None:
+        for ck in ("case", "test_case", "Case", "testCase"):
+            c = result_dict.get(ck)
+            if isinstance(c, dict):
+                take_from_mapping(to_dict(c))
+            if str_params is not None:
+                break
+
+    param_groups = _normalize_param_groups_v1(groups_raw)
+    return str_params, param_groups
+
+
+def _v2_result_row_identity(
+    target_case_id: Optional[int],
+    str_params: Optional[Dict[str, str]],
+    result_dict: Dict[str, Any],
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    v2 `id` (idempotency) + `signature` so bulk create does not collapse parameterized rows.
+    Prefer source hash for `id`; build `signature` from case id + params (+ hash when present).
+    """
+    row_id: Optional[str] = None
+    sh = result_dict.get("hash") or result_dict.get("result_hash")
+    if isinstance(sh, str) and sh.strip():
+        row_id = sh.strip()
+
+    existing = result_dict.get("signature")
+    if isinstance(existing, str) and existing.strip():
+        return row_id, existing.strip()
+
+    tc_key = str(int(target_case_id)) if target_case_id is not None else "none"
+    if str_params:
+        ppart = "|".join(f"{k}={v}" for k, v in sorted(str_params.items()))
+        sig = f"{tc_key}:{ppart}"
+        if row_id:
+            sig = f"{sig}:{row_id}"
+        return row_id, sig
+    if row_id:
+        return row_id, f"{tc_key}:{row_id}"
+    return row_id, None
+
+
+def _standalone_migration_description(result_dict: Dict[str, Any], source_case_id: Any) -> str:
+    lines = [
+        "Imported by workspace migration (no mapped test case on target).",
+    ]
+    if source_case_id is not None:
+        lines.append(f"Source case_id: {source_case_id}")
+    h = result_dict.get("hash") or result_dict.get("result_hash")
+    if h:
+        lines.append(f"Source result hash: {h}")
+    return "\n".join(lines)
+
+
+def _suite_relations_from_path_titles(titles: List[str]) -> Optional[ResultRelations]:
+    data: List[RelationSuiteItem] = []
+    for t in titles:
+        s = str(t).strip()
+        if not s:
+            continue
+        if len(s) > 500:
+            s = s[:497] + "..."
+        data.append(RelationSuiteItem(title=s))
+    if not data:
+        return None
+    return ResultRelations(suite=RelationSuite(data=data))
+
+
+def _placeholder_automated_test_title(
+    result_dict: Dict[str, Any], target_case_id: Optional[int]
+) -> str:
+    """When the public API omits case/result titles, use a readable stable label."""
+    for key in ("case_id", "CaseId", "test_case_id"):
+        v = result_dict.get(key)
+        if v is not None and str(v).strip():
+            try:
+                return f"Automated Test {int(v)}"
+            except (TypeError, ValueError):
+                pass
+    rid = result_dict.get("id")
+    if rid is not None and str(rid).strip():
+        try:
+            return f"Automated Test {int(rid)}"
+        except (TypeError, ValueError):
+            pass
+    if target_case_id is not None:
+        return f"Automated Test {int(target_case_id)}"
+    sh = result_dict.get("hash") or result_dict.get("result_hash")
+    if isinstance(sh, str) and sh.strip():
+        s = sh.strip()
+        return f"Automated Test {s[:12]}"
+    return "Automated Test"
+
+
+def _resolve_result_display_title(
+    result_dict: Dict[str, Any], target_case_id: Optional[int]
+) -> str:
+    """Use payload title fields when present; otherwise ``Automated Test {…}`` placeholder."""
     title = _pick_str(
         result_dict,
         "title",
@@ -738,21 +992,18 @@ def _resolve_result_display_title(result_dict: Dict[str, Any], target_case_id: i
     )
     if title:
         return title
-    rt = result_dict.get("_resolved_case_title")
-    if isinstance(rt, str) and rt.strip():
-        return rt.strip()
     for key in ("case", "test_case", "TestCase"):
         c = result_dict.get(key)
         if isinstance(c, dict):
             title = _pick_str(c, "title", "Title", "name", "Name")
             if title:
                 return title
-    return f"Case {target_case_id}"
+    return _placeholder_automated_test_title(result_dict, target_case_id)
 
 
 def _source_to_result_create_v2(
     result_dict: Dict[str, Any],
-    target_case_id: int,
+    target_case_id: Optional[int],
     mappings: MigrationMappings,
     author_uuid_to_id_mapping: Dict[str, int],
     attachment_mapping: Dict[str, str],
@@ -805,24 +1056,40 @@ def _source_to_result_create_v2(
         if built:
             steps_models = built
 
-    params = result_dict.get("param")
-    if isinstance(params, dict) and params:
-        str_params = {str(k): str(v) if v is not None else "" for k, v in params.items()}
-    else:
-        str_params = None
-
-    param_groups = result_dict.get("param_groups")
-    if not isinstance(param_groups, list) or not param_groups:
-        param_groups = None
+    str_params, param_groups = _extract_v2_params_from_result(result_dict)
+    row_id, v2_signature = _v2_result_row_identity(target_case_id, str_params, result_dict)
 
     defect = result_dict.get("defect")
     defect_b: Optional[bool] = bool(defect) if defect is not None else None
 
+    rels: Optional[ResultRelations] = None
+    sp = result_dict.get("_source_suite_path_titles")
+    if isinstance(sp, list) and sp:
+        rels = _suite_relations_from_path_titles([str(x) for x in sp])
+
+    author_internal_id = _resolve_target_author_id(
+        result_dict, mappings, author_uuid_to_id_mapping
+    )
+    author_str = str(author_internal_id) if author_internal_id is not None else None
+
     kwargs: Dict[str, Any] = {
         "title": title,
-        "testops_id": int(target_case_id),
         "execution": execution,
     }
+    if target_case_id is not None:
+        kwargs["testops_id"] = int(target_case_id)
+    else:
+        desc = _standalone_migration_description(result_dict, result_dict.get("case_id"))
+        if attachment_mapping:
+            rw = _rewrite_text(desc, attachment_mapping, target_workspace_hash)
+            desc = rw if rw else desc
+        kwargs["fields"] = ResultCreateFields(
+            description=desc,
+            author=author_str,
+            executed_by=author_str,
+        )
+    if rels:
+        kwargs["relations"] = rels
     if message:
         kwargs["message"] = message
     if res_attachments:
@@ -833,11 +1100,12 @@ def _source_to_result_create_v2(
         kwargs["params"] = str_params
     if param_groups:
         kwargs["param_groups"] = param_groups
+    if row_id:
+        kwargs["id"] = row_id
+    if v2_signature:
+        kwargs["signature"] = v2_signature
     if defect_b is not None:
         kwargs["defect"] = defect_b
-
-    _resolve_target_author_id(result_dict, mappings, author_uuid_to_id_mapping)
-    # v2 ResultCreate has no author_id; attribution is implicit / not migrated on v2 create
 
     return ResultCreate(**kwargs)
 
@@ -856,7 +1124,7 @@ def _complete_target_run_safely(
     for attempt in range(max_attempts):
         try:
             runs_api.complete_run(code=project_code, id=run_id)
-            logger.debug("complete_run ok project=%s run_id=%s", project_code, run_id)
+            logger.info("complete_run ok project=%s run_id=%s", project_code, run_id)
             if trace:
                 trace.event(
                     "run_complete_ok",
@@ -978,6 +1246,147 @@ def _create_results_v2_with_retry(
     return False
 
 
+def _collect_run_result_hashes(
+    target_service: QaseService,
+    project_code: str,
+    run_id: int,
+) -> set:
+    """Set of result hash strings currently on the target run (v1 list API)."""
+    out: set = set()
+    try:
+        rows = extract_results(target_service, project_code, int(run_id))
+        for r in rows:
+            d = r if isinstance(r, dict) else to_dict(r)
+            h = d.get("hash") or d.get("result_hash")
+            if h:
+                out.add(str(h))
+    except Exception as e:
+        logger.debug("collect_run_result_hashes failed run=%s: %s", run_id, e)
+    return out
+
+
+def _map_chunk_hashes_fallback(
+    chunk_rows: List[Dict[str, Any]],
+    target_results_after: List[Any],
+    new_hashes: set,
+    result_hash_mapping: Dict[str, str],
+) -> None:
+    used_th: set = set()
+    for row in chunk_rows:
+        sh = row["source"].get("hash")
+        if not sh:
+            continue
+        rc = row["create"]
+        tid = getattr(rc, "testops_id", None)
+        tit = (getattr(rc, "title", None) or "").strip()
+        for r in target_results_after:
+            trd = r if isinstance(r, dict) else to_dict(r)
+            th = trd.get("hash") or trd.get("result_hash")
+            if not th or str(th) not in new_hashes or str(th) in used_th:
+                continue
+            tc = trd.get("case_id")
+            if tid is not None and tc != tid:
+                continue
+            if tid is None:
+                trti = _pick_str(trd, "title", "Title", "name", "Name")
+                if tit and trti and tit != trti.strip():
+                    continue
+            used_th.add(str(th))
+            result_hash_mapping[str(sh)] = str(th)
+            break
+
+
+def _map_chunk_hashes_by_delta(
+    chunk_rows: List[Dict[str, Any]],
+    target_results_after: List[Any],
+    new_hashes: set,
+    result_hash_mapping: Dict[str, str],
+) -> None:
+    """Pair each created row with its source hash using hashes added since the previous fetch."""
+    ordered_new: List[str] = []
+    for r in target_results_after:
+        d = r if isinstance(r, dict) else to_dict(r)
+        h = d.get("hash") or d.get("result_hash")
+        if h and str(h) in new_hashes:
+            ordered_new.append(str(h))
+    n_chunk = len(chunk_rows)
+    if len(ordered_new) > n_chunk:
+        logger.debug(
+            "Result hash delta: %s new hashes for chunk size %s; using trailing %s",
+            len(ordered_new),
+            n_chunk,
+            n_chunk,
+        )
+        ordered_new = ordered_new[-n_chunk:]
+    if len(ordered_new) != n_chunk:
+        logger.warning(
+            "Result hash delta count mismatch (chunk=%s, new_hashes=%s). Using fallback matching.",
+            n_chunk,
+            len(ordered_new),
+        )
+        _map_chunk_hashes_fallback(
+            chunk_rows, target_results_after, new_hashes, result_hash_mapping
+        )
+        return
+    for row, th in zip(chunk_rows, ordered_new):
+        sh = row["source"].get("hash")
+        if sh and th:
+            result_hash_mapping[str(sh)] = th
+
+
+def _augment_runs_to_complete_from_source_details(
+    source_service: QaseService,
+    project_code_source: str,
+    project_code_target: str,
+    mappings: MigrationMappings,
+) -> None:
+    """
+    List runs sometimes omit completion flags. For any target run not yet queued, GET source
+    run detail and queue complete_run when the source run is finished.
+    """
+    run_m = mappings.runs.get(project_code_source) or {}
+    if not run_m:
+        return
+    if not hasattr(mappings, "_runs_to_complete"):
+        mappings._runs_to_complete = {}
+    qc = mappings._runs_to_complete.setdefault(project_code_source, {})
+
+    def _as_int(x: Any) -> Optional[int]:
+        try:
+            return int(x)
+        except (TypeError, ValueError):
+            return None
+
+    queued = {tid for tid in (_as_int(k) for k in qc.keys()) if tid is not None}
+
+    for src_raw, tgt_raw in run_m.items():
+        src = _as_int(src_raw)
+        tgt = _as_int(tgt_raw)
+        if src is None or tgt is None or tgt in queued:
+            continue
+        detail = fetch_run_detail_json(source_service, project_code_source, src)
+        if not detail or not _source_run_should_complete_after_results(detail):
+            continue
+        qc[tgt] = {
+            "project_code": project_code_target,
+            "is_completed": True,
+            "source_is_completed": bool(
+                detail.get("is_completed") or detail.get("is_complete")
+            ),
+            "has_end_time": bool(
+                detail.get("end_time")
+                or detail.get("time_end")
+                or detail.get("completed_at")
+            ),
+        }
+        queued.add(tgt)
+        logger.debug(
+            "Queued target run %s for complete_run (finished source run %s from GET detail)",
+            tgt,
+            src,
+        )
+
+
 def migrate_results(
     source_service: QaseService,
     target_service: QaseService,
@@ -1071,19 +1480,18 @@ def migrate_results(
             target_case_id = case_mapping.get(lookup_id)
             if target_case_id is None and source_case_id is not None:
                 target_case_id = case_mapping.get(source_case_id)
-            if not target_case_id:
-                if trace:
-                    trace.event(
-                        "result_skipped_no_target_case",
-                        project_source=project_code_source,
-                        source_run_id=source_run_id,
-                        target_run_id=target_run_id,
-                        source_case_id=source_case_id,
-                        lookup_id=lookup_id,
-                        raw_preview=raw_preview,
-                        enriched_summary=summarize_enriched_result(result_dict),
-                    )
-                continue
+
+            if target_case_id is None and trace:
+                trace.event(
+                    "result_standalone_no_testops_id",
+                    project_source=project_code_source,
+                    source_run_id=source_run_id,
+                    target_run_id=target_run_id,
+                    source_case_id=source_case_id,
+                    lookup_id=lookup_id,
+                    raw_preview=raw_preview,
+                    enriched_summary=summarize_enriched_result(result_dict),
+                )
 
             try:
                 rc = _source_to_result_create_v2(
@@ -1131,6 +1539,10 @@ def migrate_results(
                 )
             continue
 
+        seen_target_hashes = _collect_run_result_hashes(
+            target_service, project_code_target, int(target_run_id)
+        )
+
         for chunk_idx, chunk_rows in enumerate(chunks(batch_rows, 500)):
             results_list: List[ResultCreate] = [r["create"] for r in chunk_rows]
             request = CreateResultsRequestV2(results=results_list)
@@ -1162,22 +1574,31 @@ def migrate_results(
             ):
                 created_results += len(chunk_rows)
                 try:
+                    # v2 bulk may persist asynchronously; poll so hash delta is not always empty.
+                    after_hashes: set = set()
+                    new_hashes: set = set()
+                    delay_s = 0.0
+                    for attempt in range(6):
+                        if delay_s > 0:
+                            time.sleep(delay_s)
+                        after_hashes = _collect_run_result_hashes(
+                            target_service, project_code_target, int(target_run_id)
+                        )
+                        new_hashes = after_hashes - seen_target_hashes
+                        if new_hashes or len(chunk_rows) == 0 or attempt == 5:
+                            break
+                        delay_s = 0.5 if attempt == 0 else min(0.5 * (2**attempt), 3.0)
+
                     target_results = extract_results(
                         target_service, project_code_target, int(target_run_id)
                     )
-                    for row in chunk_rows:
-                        sd = row["source"]
-                        sh = sd.get("hash")
-                        tcid = case_mapping.get(sd.get("case_id"))
-                        if not tcid:
-                            continue
-                        for tr in target_results:
-                            trd = tr if isinstance(tr, dict) else to_dict(tr)
-                            if trd.get("case_id") == tcid:
-                                th = trd.get("hash")
-                                if sh and th:
-                                    result_hash_mapping[str(sh)] = str(th)
-                                break
+                    _map_chunk_hashes_by_delta(
+                        chunk_rows,
+                        target_results,
+                        new_hashes,
+                        result_hash_mapping,
+                    )
+                    seen_target_hashes = after_hashes
                 except Exception as hash_error:
                     logger.warning(
                         "Could not map result hashes after v2 bulk run %s: %s",
@@ -1200,6 +1621,13 @@ def migrate_results(
                     )
 
     stats.add_entity("results", total_results, created_results)
+
+    _augment_runs_to_complete_from_source_details(
+        source_service,
+        project_code_source,
+        project_code_target,
+        mappings,
+    )
 
     if hasattr(mappings, "_runs_to_complete") and project_code_source in mappings._runs_to_complete:
         runs_to_complete = mappings._runs_to_complete[project_code_source]

@@ -29,8 +29,15 @@ class MigrationTrace:
                 rec[k] = _json_safe(v, deep=True)
         line = json.dumps(rec, ensure_ascii=False, default=_fallback_json)
         with self._lock:
-            self._fh.write(line + "\n")
-            self._fh.flush()
+            fh = self._fh
+            if fh is None:
+                return
+            try:
+                fh.write(line + "\n")
+                fh.flush()
+            except (ValueError, OSError):
+                # Closed handle or I/O error (e.g. interrupt during migration)
+                return
 
     def close(self) -> None:
         with self._lock:
@@ -140,7 +147,6 @@ def summarize_enriched_result(result_dict: Dict[str, Any]) -> Dict[str, Any]:
         "hash": rd.get("hash"),
         "status_id": rd.get("status_id"),
         "title": (rd.get("title") or "")[:200],
-        "resolved_case_title": (rd.get("_resolved_case_title") or "")[:200] or None,
         "n_steps": len(steps) if isinstance(steps, list) else 0,
         "n_attachments_coalesced": len(att) if isinstance(att, list) else 0,
         "n_files": len(rd.get("files") or []) if isinstance(rd.get("files"), list) else 0,
