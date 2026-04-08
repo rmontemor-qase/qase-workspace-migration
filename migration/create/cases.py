@@ -319,7 +319,7 @@ def migrate_cases(
     from migration.extract.cases import extract_cases
     
     case_mapping = {}
-    limit = 100 if not target_service.enterprise else 20
+    limit = 20
     
     raw_api_client = QaseRawApiClient(
         base_url=target_service.client.configuration.host,

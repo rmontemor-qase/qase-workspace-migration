@@ -369,7 +369,6 @@ def _qase_service_kw(svc: QaseService) -> Dict[str, Any]:
         "api_token": svc.api_token,
         "host": svc.host,
         "ssl": svc.ssl,
-        "enterprise": svc.enterprise,
         "scim_token": getattr(svc, "scim_token", None),
         "scim_host": getattr(svc, "scim_host", None),
     }

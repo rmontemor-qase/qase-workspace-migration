@@ -3,6 +3,7 @@ Migrate users between source and target Qase workspaces.
 Supports SCIM-based user creation and mapping.
 """
 import logging
+import sys
 from typing import Dict, List, Any, Optional
 from qase.api_client_v1.api.authors_api import AuthorsApi
 from qase_service import QaseService
@@ -30,6 +31,109 @@ def parse_name(full_name: str):
     return (parts[0], parts[1])
 
 
+def _scim_user_display_line(user: Dict[str, Any]) -> str:
+    email = (user.get("userName") or "").strip()
+    name = user.get("name") or {}
+    if not isinstance(name, dict):
+        name = {}
+    formatted = (name.get("formatted") or "").strip()
+    given = (name.get("givenName") or "").strip()
+    family = (name.get("familyName") or "").strip()
+    label = formatted or f"{given} {family}".strip() or "—"
+    active = user.get("active", True)
+    status = "" if active else " (inactive)"
+    return f"  - {email}  |  {label}{status}"
+
+
+def _collect_pending_user_creates(
+    source_users: List[Dict[str, Any]],
+    target_users_by_email: Dict[str, Any],
+    create_users: bool,
+    create_inactive: bool,
+    has_scim: bool,
+) -> List[Dict[str, Any]]:
+    """Source users that would be created on target (email not present, SCIM create path)."""
+    if not create_users or not has_scim:
+        return []
+    pending: List[Dict[str, Any]] = []
+    for source_user in source_users:
+        source_email = (source_user.get("email") or "").lower()
+        source_id = source_user.get("id")
+        if not source_id or not source_email:
+            continue
+        if source_email in target_users_by_email:
+            continue
+        source_is_active = source_user.get("is_active", True)
+        if not source_is_active and not create_inactive:
+            continue
+        pending.append(source_user)
+    return pending
+
+
+def _prompt_user_creation_confirm(
+    existing_scim_users: List[Dict[str, Any]],
+    pending_creates: List[Dict[str, Any]],
+    users_config: Dict[str, Any],
+) -> bool:
+    """
+    Print existing target users and pending creates; require typing 'yes' to proceed.
+    Returns True if creation should proceed.
+    """
+    skip = bool(users_config.get("skip_creation_confirm", False))
+    if skip:
+        logger.info("users.skip_creation_confirm is true: skipping interactive user-creation prompt.")
+        return True
+
+    print("\n" + "=" * 72)
+    print(f"EXISTING USERS ON TARGET WORKSPACE ({len(existing_scim_users)})")
+    print("=" * 72)
+    sorted_existing = sorted(
+        existing_scim_users,
+        key=lambda u: (u.get("userName") or "").lower(),
+    )
+    for u in sorted_existing:
+        print(_scim_user_display_line(u))
+    if not sorted_existing:
+        print("  (none retrieved via SCIM)")
+
+    print("\n" + "=" * 72)
+    print(f"USERS TO BE CREATED ON TARGET ({len(pending_creates)})")
+    print("=" * 72)
+    sorted_pending = sorted(
+        pending_creates,
+        key=lambda u: (u.get("email") or "").lower(),
+    )
+    for u in sorted_pending:
+        email = u.get("email", "")
+        name = u.get("name", "") or "—"
+        role = u.get("role", "Member")
+        active = u.get("is_active", True)
+        act = "" if active else " [inactive]"
+        print(f"  - {email}  |  {name}  |  role={role}{act}")
+
+    print("\n" + "=" * 72)
+    if not sys.stdin.isatty():
+        logger.error(
+            "Cannot prompt for user-creation confirmation (stdin is not a TTY). "
+            "Run in an interactive terminal, set users.skip_creation_confirm to true "
+            "only if you accept creating users without confirmation, or set users.create to false."
+        )
+        return False
+
+    try:
+        reply = input("Type yes (exactly) to create these users on the target workspace: ")
+    except EOFError:
+        logger.error("EOF on stdin; aborting user creation.")
+        return False
+
+    if reply == "yes":
+        logger.info("User confirmed: proceeding with SCIM user creation.")
+        return True
+
+    logger.warning('User did not type "yes"; skipping SCIM user creation (unmapped users will use users.default).')
+    return False
+
+
 def migrate_users(
     source_service: QaseService,
     target_service: QaseService,
@@ -55,6 +159,7 @@ def migrate_users(
             - users.create: Whether to create missing users (default: False)
             - users.inactive: Whether to create inactive users (default: False)
             - users.default: Default user ID for unmapped users (default: 1)
+            - users.skip_creation_confirm: If true, skip the interactive prompt before SCIM user creation (default: False)
     
     Returns:
         Dictionary mapping source user ID to target user ID
@@ -153,6 +258,37 @@ def migrate_users(
         
         logger.info(f"Retrieved {len(target_users_by_email)} users from target via API")
     
+    has_scim = bool(target_service.scim_client)
+    pending_creates = _collect_pending_user_creates(
+        source_users,
+        target_users_by_email,
+        create_users,
+        create_inactive,
+        has_scim,
+    )
+
+    effective_create = create_users
+    if create_users and has_scim and pending_creates:
+        existing_scim_users: List[Dict[str, Any]] = []
+        try:
+            existing_scim_users = target_service.scim_client.get_all_users()
+        except Exception as e:
+            logger.warning(
+                "Could not fetch target users via SCIM for confirmation summary: %s", e
+            )
+        if not existing_scim_users and target_users_by_email:
+            existing_scim_users = [
+                {
+                    "userName": email,
+                    "name": {"formatted": ""},
+                    "active": bool(data.get("active", True)),
+                }
+                for email, data in sorted(target_users_by_email.items())
+            ]
+        effective_create = _prompt_user_creation_confirm(
+            existing_scim_users, pending_creates, users_config
+        )
+
     # Build user mapping: source_id -> target_id
     # Process:
     # 1. Get emails and ids from source (already done above)
@@ -200,7 +336,7 @@ def migrate_users(
                 user_uuid_mapping[str(source_user_uuid)] = target_user_id_int
             
             mapped_count += 1
-        elif create_users and target_service.scim_client:
+        elif effective_create and target_service.scim_client:
             # Create user via SCIM
             if not source_is_active and not create_inactive:
                 # Skip inactive users if not configured to create them

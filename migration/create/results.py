@@ -1246,23 +1246,29 @@ def _create_results_v2_with_retry(
     return False
 
 
+def _result_rows_to_hash_set(rows: List[Any]) -> set:
+    """Build a set of result hash strings from v1-style result rows."""
+    out: set = set()
+    for r in rows:
+        d = r if isinstance(r, dict) else to_dict(r)
+        h = d.get("hash") or d.get("result_hash")
+        if h:
+            out.add(str(h))
+    return out
+
+
 def _collect_run_result_hashes(
     target_service: QaseService,
     project_code: str,
     run_id: int,
 ) -> set:
     """Set of result hash strings currently on the target run (v1 list API)."""
-    out: set = set()
     try:
         rows = extract_results(target_service, project_code, int(run_id))
-        for r in rows:
-            d = r if isinstance(r, dict) else to_dict(r)
-            h = d.get("hash") or d.get("result_hash")
-            if h:
-                out.add(str(h))
+        return _result_rows_to_hash_set(rows)
     except Exception as e:
         logger.debug("collect_run_result_hashes failed run=%s: %s", run_id, e)
-    return out
+        return set()
 
 
 def _map_chunk_hashes_fallback(
@@ -1319,8 +1325,8 @@ def _map_chunk_hashes_by_delta(
         )
         ordered_new = ordered_new[-n_chunk:]
     if len(ordered_new) != n_chunk:
-        logger.warning(
-            "Result hash delta count mismatch (chunk=%s, new_hashes=%s). Using fallback matching.",
+        logger.debug(
+            "Result hash delta count mismatch (chunk=%s, new_hashes=%s); using fallback matching.",
             n_chunk,
             len(ordered_new),
         )
@@ -1574,24 +1580,32 @@ def migrate_results(
             ):
                 created_results += len(chunk_rows)
                 try:
-                    # v2 bulk may persist asynchronously; poll so hash delta is not always empty.
+                    # v2 bulk may persist asynchronously. Wait until we see at least as many
+                    # new hashes as rows in this chunk (or exhaust attempts) so delta mapping
+                    # usually succeeds without fallback. Reuse the last list fetch — no extra
+                    # extract_results after polling.
+                    n_need = len(chunk_rows)
+                    max_poll = 8
+                    delay_s = 0.0
+                    target_results: List[Any] = []
                     after_hashes: set = set()
                     new_hashes: set = set()
-                    delay_s = 0.0
-                    for attempt in range(6):
+                    for attempt in range(max_poll):
                         if delay_s > 0:
                             time.sleep(delay_s)
-                        after_hashes = _collect_run_result_hashes(
+                        target_results = extract_results(
                             target_service, project_code_target, int(target_run_id)
                         )
+                        after_hashes = _result_rows_to_hash_set(target_results)
                         new_hashes = after_hashes - seen_target_hashes
-                        if new_hashes or len(chunk_rows) == 0 or attempt == 5:
+                        if n_need == 0:
                             break
-                        delay_s = 0.5 if attempt == 0 else min(0.5 * (2**attempt), 3.0)
+                        if len(new_hashes) >= n_need:
+                            break
+                        if attempt == max_poll - 1:
+                            break
+                        delay_s = 0.12 if attempt == 0 else min(0.2 * (1.55**attempt), 2.5)
 
-                    target_results = extract_results(
-                        target_service, project_code_target, int(target_run_id)
-                    )
                     _map_chunk_hashes_by_delta(
                         chunk_rows,
                         target_results,
@@ -1600,7 +1614,7 @@ def migrate_results(
                     )
                     seen_target_hashes = after_hashes
                 except Exception as hash_error:
-                    logger.warning(
+                    logger.debug(
                         "Could not map result hashes after v2 bulk run %s: %s",
                         target_run_id,
                         hash_error,

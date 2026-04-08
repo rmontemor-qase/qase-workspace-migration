@@ -11,40 +11,34 @@ import certifi
 class QaseService:
     """Service class for interacting with Qase API."""
     
-    def __init__(self, api_token: str, host: str = "qase.io", ssl: bool = True, 
-                 enterprise: bool = False, scim_token: str = None, scim_host: str = None):
+    def __init__(self, api_token: str, host: str = "qase.io", ssl: bool = True,
+                 scim_token: str = None, scim_host: str = None):
         """
         Initialize Qase API clients.
         
         Args:
             api_token: Qase API token
-            host: Qase host (default: "qase.io")
+            host: Qase host (default: "qase.io"). Drives API base URL; SCIM host defaults
+                from host (see scim_host).
             ssl: Use SSL (default: True)
-            enterprise: Is enterprise instance (default: False)
             scim_token: SCIM token for user/group management (optional)
-            scim_host: SCIM host (default: "app.qase.io" or derived from host)
+            scim_host: Override SCIM host. If omitted: ``app.qase.io`` when host is
+                ``qase.io`` (cloud), otherwise the same value as ``host`` (enterprise).
         """
         self.api_token = api_token
         self.host = host
         self.ssl = ssl
-        self.enterprise = enterprise
         self.scim_token = scim_token
-        
-        # Determine SCIM host
         if scim_host:
             self.scim_host = scim_host
-        elif enterprise:
-            # For enterprise, SCIM might be on the same domain
-            self.scim_host = host
+        elif host == 'qase.io':
+            self.scim_host = 'app.qase.io'
         else:
-            # Default cloud SCIM host
-            self.scim_host = "app.qase.io"
+            self.scim_host = host
         
-        # Determine API host format
-        # Cloud: api.qase.io/v1
-        # Enterprise custom domain: api-{host}/v1
+        # API host: Cloud qase.io -> api.qase.io; custom domain -> api-{host}
         ssl_prefix = 'https://' if ssl else 'http://'
-        delimiter = '.' if not enterprise or host == 'qase.io' else '-'
+        delimiter = '.' if host == 'qase.io' else '-'
         
         api_host_v1 = f'{ssl_prefix}api{delimiter}{host}/v1'
         api_host_v2 = f'{ssl_prefix}api{delimiter}{host}/v2'

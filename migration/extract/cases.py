@@ -10,7 +10,7 @@ from migration.utils import retry_with_backoff, extract_entities_from_response, 
 logger = logging.getLogger(__name__)
 
 
-def extract_cases(source_service: QaseService, project_code: str, limit: int = 100) -> List[Dict[str, Any]]:
+def extract_cases(source_service: QaseService, project_code: str, limit: int = 20) -> List[Dict[str, Any]]:
     """
     Extract test cases from source project.
     Uses bulk extraction via get_cases() which returns full case details including steps.
@@ -18,7 +18,7 @@ def extract_cases(source_service: QaseService, project_code: str, limit: int = 1
     Args:
         source_service: Source Qase service
         project_code: Project code
-        limit: Batch size (default 100, or 20 for enterprise)
+        limit: Batch size (default 20)
     
     Returns:
         List of case dictionaries with full details including steps and member_id

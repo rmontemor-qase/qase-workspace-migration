@@ -2,24 +2,21 @@
   "source": {
     "api_token": "YOUR_SOURCE_API_TOKEN",
     "scim_token": "YOUR_SOURCE_SCIM_TOKEN",
-    "scim_host": "app.qase.io",
     "host": "qase.io",
-    "enterprise": false,
     "ssl": true
   },
   "target": {
     "api_token": "YOUR_TARGET_API_TOKEN",
     "scim_token": "YOUR_TARGET_SCIM_TOKEN",
-    "scim_host": "app.qase.io",
-    "host": "qase.io",
-    "enterprise": false,
+    "host": "your-enterprise-domain",
     "ssl": true
   },
   "users": {
     "migrate": true,
     "create": true,
     "inactive": false,
-    "default": 1
+    "default": 1,
+    "skip_creation_confirm": false
   },
   "groups": {
     "create": true

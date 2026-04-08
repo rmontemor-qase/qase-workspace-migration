@@ -71,11 +71,9 @@ def parse_args():
             config_defaults = {
                 'source_token': source_config.get('api_token'),
                 'source_host': source_config.get('host', 'qase.io'),
-                'source_enterprise': source_config.get('enterprise', False),
                 'source_ssl': source_config.get('ssl', True),
                 'target_token': target_config.get('api_token'),
                 'target_host': target_config.get('host', 'qase.io'),
-                'target_enterprise': target_config.get('enterprise', False),
                 'target_ssl': target_config.get('ssl', True),
                 'mappings_file': options_config.get('mappings_file', 'mappings.json'),
                 'preserve_ids': options_config.get('preserve_ids', False),
@@ -93,18 +91,14 @@ def parse_args():
     parser.add_argument('--source-token', default=config_defaults.get('source_token'),
                        help='Source workspace API token')
     parser.add_argument('--source-host', default=config_defaults.get('source_host', 'qase.io'),
-                       help='Source workspace host (default: qase.io)')
-    parser.add_argument('--source-enterprise', action='store_true',
-                       help='Source is enterprise instance')
+                       help='Source workspace host (default: qase.io; custom domain uses api-{host})')
     parser.add_argument('--source-ssl', action='store_true', 
                        help='Use SSL for source')
     
     parser.add_argument('--target-token', default=config_defaults.get('target_token'),
                        help='Target workspace API token')
     parser.add_argument('--target-host', default=config_defaults.get('target_host', 'qase.io'),
-                       help='Target workspace host (default: qase.io)')
-    parser.add_argument('--target-enterprise', action='store_true',
-                       help='Target is enterprise instance')
+                       help='Target workspace host (default: qase.io; custom domain uses api-{host})')
     parser.add_argument('--target-ssl', action='store_true',
                        help='Use SSL for target')
     
@@ -124,12 +118,8 @@ def parse_args():
     args = parser.parse_args()
     
     if config_defaults:
-        if not args.source_enterprise:
-            args.source_enterprise = config_defaults.get('source_enterprise', False)
         if not args.source_ssl:
             args.source_ssl = config_defaults.get('source_ssl', True)
-        if not args.target_enterprise:
-            args.target_enterprise = config_defaults.get('target_enterprise', False)
         if not args.target_ssl:
             args.target_ssl = config_defaults.get('target_ssl', True)
         if not args.preserve_ids:
@@ -178,7 +168,6 @@ def main():
         api_token=args.source_token,
         host=args.source_host,
         ssl=args.source_ssl,
-        enterprise=args.source_enterprise,
         scim_token=source_scim_token,
         scim_host=source_scim_host
     )
@@ -187,7 +176,6 @@ def main():
         api_token=args.target_token,
         host=args.target_host,
         ssl=args.target_ssl,
-        enterprise=args.target_enterprise,
         scim_token=target_scim_token,
         scim_host=target_scim_host
     )
@@ -329,7 +317,6 @@ def main():
             "api_token": args.source_token,
             "host": args.source_host,
             "ssl": args.source_ssl,
-            "enterprise": args.source_enterprise,
             "scim_token": source_scim_token,
             "scim_host": source_scim_host,
         }
@@ -337,7 +324,6 @@ def main():
             "api_token": args.target_token,
             "host": args.target_host,
             "ssl": args.target_ssl,
-            "enterprise": args.target_enterprise,
             "scim_token": target_scim_token,
             "scim_host": target_scim_host,
         }

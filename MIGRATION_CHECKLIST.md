@@ -247,7 +247,7 @@ CLI filters applied before/at project list: `--only-projects`, `--skip-projects`
 
 **Batching:**
 
-- [ ] **13.16** Batch size 100 (non-enterprise) or 20 (enterprise) on target service flag
+- [ ] **13.16** Batch size 20 for case migration (list/get)
 
 - [ ] **13.17** `mappings.cases[source_project][source_case_id] → target_case_id`
 
