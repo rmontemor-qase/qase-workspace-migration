@@ -1,0 +1,23 @@
+README.md
+  8af300148d0f9b86 15,254,275,285,287
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.6",
+  "base_commit_sha": "85f7c6f1a30d6f56be3ebad68e5aefbb026e31c3",
+  "prompts": {
+    "8af300148d0f9b86": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "a250b59a-d7f7-4b32-927f-b83863cb7f60",
+        "model": "composer-2"
+      },
+      "human_author": "rmontemor-qase",
+      "messages": [],
+      "total_additions": 14,
+      "total_deletions": 21,
+      "accepted_lines": 5,
+      "overriden_lines": 0
+    }
+  }
+}
