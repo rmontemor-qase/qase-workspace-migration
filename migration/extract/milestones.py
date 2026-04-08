@@ -5,6 +5,7 @@ import logging
 from typing import List, Dict, Any
 from qase.api_client_v1.api.milestones_api import MilestonesApi
 from qase_service import QaseService
+from migration.step_logging import step_log_info
 from migration.utils import retry_with_backoff, extract_entities_from_response, to_dict
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,7 @@ def extract_milestones(source_service: QaseService, project_code: str) -> List[D
     Returns:
         List of milestone dictionaries
     """
-    logger.info(f"Extracting milestones from project {project_code}...")
+    step_log_info(logger, "Extracting milestones from project %s...", project_code)
     milestones_api_source = MilestonesApi(source_service.client)
     
     milestones = []
@@ -47,5 +48,10 @@ def extract_milestones(source_service: QaseService, project_code: str) -> List[D
             break
         offset += limit
     
-    logger.info(f"Extracted {len(milestones)} milestones from project {project_code}")
+    step_log_info(
+        logger,
+        "Extracted %s milestones from project %s",
+        len(milestones),
+        project_code,
+    )
     return milestones

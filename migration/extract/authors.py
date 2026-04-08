@@ -5,6 +5,7 @@ import logging
 import requests
 from typing import List, Dict, Any
 from qase_service import QaseService
+from migration.step_logging import step_log_info
 
 logger = logging.getLogger(__name__)
 
@@ -91,5 +92,7 @@ def extract_authors(source_service: QaseService) -> Dict[str, int]:
             logger.error(f"Failed to fetch authors via raw API: {e}")
             break
     
-    logger.info(f"Extracted {len(author_uuid_to_id)} author UUID mappings")
+    step_log_info(
+        logger, "Extracted %s author UUID mappings", len(author_uuid_to_id)
+    )
     return author_uuid_to_id

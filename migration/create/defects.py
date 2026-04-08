@@ -5,6 +5,7 @@ import logging
 import re
 from typing import Dict, Any, List
 from qase_service import QaseService
+from migration.step_logging import step_log_info
 from migration.utils import MigrationMappings, MigrationStats, QaseRawApiClient
 from migration.transform.attachments import replace_attachment_hashes_in_text
 
@@ -92,10 +93,18 @@ def migrate_defects(
     source_defects = extract_defects(source_service, project_code_source)
     
     if not source_defects:
-        logger.info(f"No defects found in source project {project_code_source}")
+        step_log_info(
+            logger,
+            "No defects found in source project %s",
+            project_code_source,
+        )
         return {}
-    
-    logger.info(f"Found {len(source_defects)} defects to migrate")
+
+    step_log_info(
+        logger,
+        "Found %s defects to migrate",
+        len(source_defects),
+    )
     
     # Map severity string to integer
     severity_map = {

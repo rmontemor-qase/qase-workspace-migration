@@ -5,6 +5,7 @@ import logging
 from typing import List, Dict, Any, Tuple
 from qase.api_client_v1.api.suites_api import SuitesApi
 from qase_service import QaseService
+from migration.step_logging import step_log_info
 from migration.utils import retry_with_backoff, extract_entities_from_response, to_dict
 
 logger = logging.getLogger(__name__)
@@ -23,7 +24,7 @@ def extract_suites(source_service: QaseService, project_code: str) -> Tuple[Dict
         - all_suites_dict: suite_id -> suite_dict
         - parent_child_map: parent_id -> list of child_ids
     """
-    logger.info(f"Extracting suites from project {project_code}...")
+    step_log_info(logger, "Extracting suites from project %s...", project_code)
     suites_api_source = SuitesApi(source_service.client)
     
     all_suites = {}  # suite_id -> suite_dict
@@ -58,5 +59,7 @@ def extract_suites(source_service: QaseService, project_code: str) -> Tuple[Dict
             break
         offset += limit
     
-    logger.info(f"Extracted {len(all_suites)} suites from project {project_code}")
+    step_log_info(
+        logger, "Extracted %s suites from project %s", len(all_suites), project_code
+    )
     return all_suites, parent_child_map

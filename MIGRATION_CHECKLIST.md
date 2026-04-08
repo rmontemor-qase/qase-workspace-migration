@@ -309,8 +309,8 @@ CLI filters applied before/at project list: `--only-projects`, `--skip-projects`
 **Target write:** API **v2** `ResultsApi(target_service.client_v2).create_results_v2` with `CreateResultsRequestV2` (same family as Xray → Qase): `testops_id` = target numeric case id; `title`; `execution` (`status`, `duration` ms, `stacktrace`, `start_time`/`end_time` = `null`); `message` (markdown); `attachments` (hashes); `steps` only when non-empty — each step `data.action` / `expected_result` (action `"."` if empty), `execution.comment` for actual + step comment, `execution.attachments` (hashes); nested steps as dicts.
 
 - [ ] **16.1** `extract_authors` — raw GET `/v1/author` (used elsewhere; v2 result create has no author field on payload)
-- [ ] **16.2** Chunks of ≤500 → `create_results_v2`
-- [ ] **16.3** Refetch v1 `GET /result?run=` on target to map `result_hashes` by `case_id`
+- [ ] **16.2** Chunks of ≤500 → `create_results_v2` (retries on 429)
+- [ ] **16.3** Poll `_collect_run_result_hashes` then refetch v1 `GET /result?run=` on target to map `result_hashes` by delta (v2 persistence can lag)
 - [ ] **16.4** `complete_run` for `mappings._runs_to_complete` when applicable
 - [ ] **16.5** `mappings.result_hashes` / `author_uuid_to_id_mapping` updated as before
 

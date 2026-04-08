@@ -11,9 +11,11 @@ import logging
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Optional
+from queue import Queue
+from typing import Any, Dict, List, Optional, Tuple
 
 from qase_service import QaseService
+from migration.progress import init_tqdm_lock, stderr_supports_progress
 from migration.run_single_project import run_single_project_migration
 from migration.utils import (
     MigrationMappings,
@@ -40,6 +42,23 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+def _emit_deferred_project_summaries(
+    entries: List[Tuple[str, str, Dict[str, str]]],
+) -> None:
+    """Log per-project created/processed lines once (after tqdm bars are finished)."""
+    if not entries:
+        return
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("Per-project migration summaries")
+    logger.info("=" * 60)
+    for src, tgt, pst in sorted(entries, key=lambda x: x[0].lower()):
+        logger.info("%s -> %s", src, tgt)
+        for entity_type, count in pst.items():
+            logger.info("  %s: %s", entity_type, count)
+        logger.info("")
 
 
 def load_config(config_path: str) -> dict:
@@ -313,6 +332,13 @@ def main():
             max_parallel_projects = 4
         max_parallel_projects = min(max_parallel_projects, max(1, len(projects)))
 
+        show_project_progress = bool(opts.get("show_project_progress", True))
+        use_project_progress_bars = show_project_progress and stderr_supports_progress()
+        if use_project_progress_bars:
+            init_tqdm_lock()
+
+        deferred_project_summaries: List[Tuple[str, str, Dict[str, str]]] = []
+
         source_kw: Dict[str, Any] = {
             "api_token": args.source_token,
             "host": args.source_host,
@@ -328,24 +354,35 @@ def main():
             "scim_host": target_scim_host,
         }
 
+        progress_position_queue: Queue[int] = Queue()
+        for _pos in range(max_parallel_projects):
+            progress_position_queue.put(_pos)
+
         def _run_parallel_project_worker(project: Dict[str, Any]):
-            src = QaseService(**source_kw)
-            tgt = QaseService(**target_kw)
-            wm = fork_mappings_for_parallel_project(mappings)
-            wstats = MigrationStats()
-            run_single_project_migration(
-                project,
-                src,
-                tgt,
-                wm,
-                wstats,
-                user_mapping,
-                custom_field_mapping,
-                shared_parameter_mapping,
-                args.preserve_ids,
-                mappings_file=None,
-            )
-            return project["source_code"], wm, wstats
+            bar_pos = progress_position_queue.get()
+            try:
+                src = QaseService(**source_kw)
+                tgt = QaseService(**target_kw)
+                wm = fork_mappings_for_parallel_project(mappings)
+                wstats = MigrationStats()
+                pst = run_single_project_migration(
+                    project,
+                    src,
+                    tgt,
+                    wm,
+                    wstats,
+                    user_mapping,
+                    custom_field_mapping,
+                    shared_parameter_mapping,
+                    args.preserve_ids,
+                    mappings_file=None,
+                    show_project_progress=use_project_progress_bars,
+                    progress_position=bar_pos,
+                    emit_summary_logs=False,
+                )
+                return project["source_code"], project["target_code"], wm, wstats, pst
+            finally:
+                progress_position_queue.put(bar_pos)
 
         if parallel_projects and len(projects) > 1:
             logger.info(
@@ -361,7 +398,8 @@ def main():
                 for fut in as_completed(futures):
                     proj = futures[fut]
                     try:
-                        psrc, wm, wst = fut.result()
+                        psrc, _ptgt, wm, wst, pst = fut.result()
+                        deferred_project_summaries.append((psrc, _ptgt, pst))
                         merge_parallel_project_into_main(mappings, wm, psrc)
                         merge_migration_stats(stats, wst)
                         mappings.save_to_file(args.mappings_file)
@@ -377,7 +415,7 @@ def main():
             if len(projects) > 1 and not parallel_projects:
                 logger.info("Parallel project migration disabled (options.parallel_project_migration).")
             for project in projects:
-                run_single_project_migration(
+                pst = run_single_project_migration(
                     project,
                     source_service,
                     target_service,
@@ -388,8 +426,16 @@ def main():
                     shared_parameter_mapping,
                     args.preserve_ids,
                     mappings_file=args.mappings_file,
+                    show_project_progress=use_project_progress_bars,
+                    progress_position=0,
+                    emit_summary_logs=False,
                 )
-        
+                deferred_project_summaries.append(
+                    (project["source_code"], project["target_code"], pst)
+                )
+
+        _emit_deferred_project_summaries(deferred_project_summaries)
+
         stats.print_summary()
         
         mappings.save_to_file(args.mappings_file)

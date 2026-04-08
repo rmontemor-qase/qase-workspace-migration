@@ -3,8 +3,11 @@ Create cases in target Qase workspace.
 """
 import logging
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, TYPE_CHECKING
 from qase_service import QaseService
+
+if TYPE_CHECKING:
+    from migration.progress import ProjectMigrationProgress
 from migration.utils import (
     MigrationMappings, MigrationStats, to_dict, preserve_or_hash_id,
     QaseRawApiClient
@@ -308,7 +311,8 @@ def migrate_cases(
     user_mapping: Dict[int, int],
     mappings: MigrationMappings,
     stats: MigrationStats,
-    preserve_ids: bool = True
+    preserve_ids: bool = True,
+    progress: Optional["ProjectMigrationProgress"] = None,
 ) -> Dict[int, int]:
     """
     Migrate test cases from source to target workspace.
@@ -345,6 +349,8 @@ def migrate_cases(
         shared_parameter_mapping = {}
     
     all_source_cases = extract_cases(source_service, project_code_source, limit)
+    if progress:
+        progress.reconcile_case_cap(len(all_source_cases))
     
     if not all_source_cases:
         if project_code_source not in mappings.cases:
@@ -390,6 +396,8 @@ def migrate_cases(
                 for idx, source_id in enumerate(source_ids_batch):
                     if idx < len(created_ids):
                         case_mapping[source_id] = created_ids[idx]
+        if progress:
+            progress.add_cases(len(batch_cases))
     
     if project_code_source not in mappings.cases:
         mappings.cases[project_code_source] = {}

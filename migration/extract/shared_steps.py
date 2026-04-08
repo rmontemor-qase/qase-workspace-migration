@@ -5,6 +5,7 @@ import logging
 from typing import List, Dict, Any
 from qase.api_client_v1.api.shared_steps_api import SharedStepsApi
 from qase_service import QaseService
+from migration.step_logging import step_log_info
 from migration.utils import retry_with_backoff, extract_entities_from_response, to_dict
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,7 @@ def extract_shared_steps(source_service: QaseService, project_code: str) -> List
     Returns:
         List of shared step dictionaries
     """
-    logger.info(f"Extracting shared steps from project {project_code}...")
+    step_log_info(logger, "Extracting shared steps from project %s...", project_code)
     shared_steps_api_source = SharedStepsApi(source_service.client)
     
     shared_steps = []
@@ -50,5 +51,10 @@ def extract_shared_steps(source_service: QaseService, project_code: str) -> List
             break
         offset += limit
     
-    logger.info(f"Extracted {len(shared_steps)} shared steps from project {project_code}")
+    step_log_info(
+        logger,
+        "Extracted %s shared steps from project %s",
+        len(shared_steps),
+        project_code,
+    )
     return shared_steps

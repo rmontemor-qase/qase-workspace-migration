@@ -2,13 +2,16 @@
 Create runs in target Qase workspace.
 """
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from qase.api_client_v1.api.runs_api import RunsApi
 from qase.api_client_v1.models import RunCreate
 from qase_service import QaseService
 from migration.utils import MigrationMappings, MigrationStats, retry_with_backoff, format_datetime, QaseRawApiClient
 from migration.extract.runs import extract_runs, extract_run_cases, fetch_run_detail_json
 from migration.trace_log import summarize_source_run
+
+if TYPE_CHECKING:
+    from migration.progress import ProjectMigrationProgress
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +76,9 @@ def migrate_runs(
     plan_mapping: Dict[int, int],
     user_mapping: Dict[int, int],
     mappings: MigrationMappings,
-    stats: MigrationStats
+    stats: MigrationStats,
+    source_runs_precached: Optional[List[Dict[str, Any]]] = None,
+    progress: Optional["ProjectMigrationProgress"] = None,
 ) -> Dict[int, int]:
     """
     Migrate test runs from source to target workspace.
@@ -142,7 +147,10 @@ def migrate_runs(
         pass
     
     run_mapping = {}
-    source_runs = extract_runs(source_service, project_code_source)
+    if source_runs_precached is not None:
+        source_runs = source_runs_precached
+    else:
+        source_runs = extract_runs(source_service, project_code_source)
     trace = getattr(mappings, "trace", None)
     if trace:
         trace.event(
@@ -276,8 +284,10 @@ def migrate_runs(
             run_data = RunCreate(**run_data_dict)
             create_response = retry_with_backoff(
                 runs_api_target.create_run,
+                max_retries=7,
+                base_delay=1.5,
                 code=project_code_target,
-                run_create=run_data
+                run_create=run_data,
             )
             
             if create_response:
@@ -350,6 +360,8 @@ def migrate_runs(
                 create_response_bool=bool(create_response),
                 target_run_id_resolved=target_run_id,
             )
+        if progress:
+            progress.add_runs(1)
     
     if project_code_source not in mappings.runs:
         mappings.runs[project_code_source] = {}

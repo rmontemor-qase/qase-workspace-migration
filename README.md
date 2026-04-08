@@ -14,6 +14,7 @@ Connection settings are **host-driven**: set `host` (and optionally `scim_host`)
 - ✅ **Resume**: Can resume interrupted migrations from saved mappings (`options.resume`)
 - ✅ **Resilience**: Retries when Qase is temporarily busy; detailed logging and statistics
 - ✅ **Case list/create batching**: Test cases are read and created in batches of **20** against the API (works consistently on cloud and custom-domain instances)
+- ✅ **Per-project progress**: In an interactive terminal, each project can show a live bar for **cases**, **runs**, and **results** (source totals are estimated up front; turn off with **`options.show_project_progress`**: **`false`** if you only want log lines)
 
 ## What this tool migrates (included scope)
 
@@ -197,6 +198,7 @@ General migration behavior, project selection, parallelism, and tracing.
 | `max_parallel_projects` | number | `4` | Maximum concurrent project workers when `parallel_project_migration` is **`true`**. |
 | `migration_trace_file` | string | `"migration_trace.jsonl"` | JSONL path for structured trace events. To **disable** tracing, set this key to **`false`**, **`null`**, or **`""`** (empty string). |
 | `migration_trace_full_payloads` | boolean | `false` | If **`true`**, trace events may include fuller payloads (larger files). |
+| `show_project_progress` | boolean | `true` | If **`true`** and **standard error** is a terminal (TTY), shows one progress bar per project (up to `max_parallel_projects` at once when parallel migration is on). Set **`false`** for log-only or CI output. Bars cover **test cases**, **runs**, and **results** only; earlier steps (milestones, suites, etc.) are not included in the bar total. |
 
 ---
 

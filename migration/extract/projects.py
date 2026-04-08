@@ -55,6 +55,24 @@ def extract_projects(source_service: QaseService, only_projects: Optional[List[s
         if len(entities) < limit:
             break
         offset += limit
-    
-    logger.info(f"Extracted {len(projects)} projects from source workspace")
-    return projects
+
+    # Same project code can appear more than once (pagination / API quirks). Migrating
+    # twice would show duplicate tqdm lines (e.g. two "DAT" bars) and double-write data.
+    seen_codes: set = set()
+    deduped: List[Dict[str, Any]] = []
+    for p in projects:
+        code = p.get("code")
+        if code is None or code == "":
+            deduped.append(p)
+            continue
+        if code in seen_codes:
+            logger.warning(
+                "Skipping duplicate source project with code %r (keep first list entry only).",
+                code,
+            )
+            continue
+        seen_codes.add(code)
+        deduped.append(p)
+
+    logger.info("Extracted %s projects from source workspace", len(deduped))
+    return deduped

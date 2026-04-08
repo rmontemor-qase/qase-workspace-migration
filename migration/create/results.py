@@ -1,9 +1,8 @@
 """
 Create results in target Qase workspace using API v2 bulk create.
 
-V1 bulk + PATCH does not reliably persist comments, step actuals, or attachments.
-V2 POST /{project}/run/{id}/results uses ResultCreate with execution, message,
-attachments, and ResultStep data.
+V2 ``POST /{project}/run/{id}/results`` uses ``ResultCreate`` with execution, message,
+attachments, and ``ResultStep`` data.
 
 Mapped results use ``testops_id``. Unmapped automated results omit ``testops_id`` and
 use ``fields`` / ``relations`` only (no v1 case bulk create — avoids filling the
@@ -15,12 +14,15 @@ prefix). ``relations.suite`` mirrors the source case suite path
 when the API exposes it (e.g. ``suite_title`` or ``suite``).
 """
 import logging
+import os
 import re
+import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
-from qase.api_client_v2.api.results_api import ResultsApi
 from qase.api_client_v1.exceptions import ApiException
+from qase.api_client_v2.api.results_api import ResultsApi
 from qase.api_client_v2.exceptions import ApiException as ApiExceptionV2
 from qase.api_client_v2.models.create_results_request_v2 import CreateResultsRequestV2
 from qase.api_client_v2.models.result_create import ResultCreate
@@ -37,6 +39,7 @@ from qase.api_client_v2.models.result_step_status import ResultStepStatus
 from qase.api_client_v1.api.runs_api import RunsApi
 from qase.api_client_v1.api.cases_api import CasesApi
 from qase_service import QaseService
+from migration.step_logging import step_log_info
 from migration.utils import MigrationMappings, MigrationStats, chunks, to_dict
 from migration.extract.results import extract_results, fetch_result_detail_json
 from migration.extract.runs import fetch_run_detail_json
@@ -49,7 +52,17 @@ from migration.trace_log import (
     summarize_result_create,
 )
 
+if TYPE_CHECKING:
+    from migration.progress import ProjectMigrationProgress
+
 logger = logging.getLogger(__name__)
+
+# I/O-bound: result detail GETs + case metadata. Cap concurrency to limit API load.
+_RESULTS_ROW_PARALLEL_MIN = 8
+_RESULTS_ROW_MAX_WORKERS = 24
+_RESULTS_RUN_PARALLEL_MAX = 6
+# Minimum row-pool size when using threads (keeps small projects from going sequential-only).
+_RESULTS_ROW_MIN_WORKERS = 4
 
 # Step fields Qase often nests under `execution` (especially automated / reporter runs).
 _STEP_EXECUTION_OVERLAY_KEYS = frozenset(
@@ -518,12 +531,24 @@ def _get_source_case_cached(
     source_service: QaseService,
     project_code: str,
     case_id: int,
+    cache_lock: Optional[threading.Lock] = None,
 ) -> Dict[str, Any]:
-    if case_id in cache:
-        return cache[case_id]
+    if cache_lock is None:
+        if case_id in cache:
+            return cache[case_id]
+        meta = _fetch_source_case_metadata(source_service, project_code, case_id)
+        cache[case_id] = meta
+        return meta
+
+    with cache_lock:
+        if case_id in cache:
+            return cache[case_id]
     meta = _fetch_source_case_metadata(source_service, project_code, case_id)
-    cache[case_id] = meta
-    return meta
+    with cache_lock:
+        if case_id in cache:
+            return cache[case_id]
+        cache[case_id] = meta
+        return meta
 
 
 def enrich_source_result_for_v2(
@@ -531,6 +556,7 @@ def enrich_source_result_for_v2(
     source_service: QaseService,
     project_code: str,
     case_steps_cache: Dict[int, Dict[str, Any]],
+    cache_lock: Optional[threading.Lock] = None,
 ) -> Dict[str, Any]:
     out = dict(result_dict)
     h = out.get("hash")
@@ -562,7 +588,9 @@ def enrich_source_result_for_v2(
         except (TypeError, ValueError):
             cid = None
         if cid is not None:
-            meta = _get_source_case_cached(case_steps_cache, source_service, project_code, cid)
+            meta = _get_source_case_cached(
+                case_steps_cache, source_service, project_code, cid, cache_lock
+            )
             case_steps = meta.get("steps") or []
             spt = meta.get("suite_path_titles") or []
             if isinstance(spt, list) and spt:
@@ -1110,71 +1138,6 @@ def _source_to_result_create_v2(
     return ResultCreate(**kwargs)
 
 
-def _complete_target_run_safely(
-    runs_api: RunsApi,
-    project_code: str,
-    run_id: int,
-    max_attempts: int = 4,
-    trace: Any = None,
-    trace_extra: Optional[Dict[str, Any]] = None,
-) -> None:
-    """Call complete_run without retry_with_backoff (avoids ERROR spam + swallowed failures on 4xx)."""
-    delay = 1.0
-    extra = dict(trace_extra or {})
-    for attempt in range(max_attempts):
-        try:
-            runs_api.complete_run(code=project_code, id=run_id)
-            logger.info("complete_run ok project=%s run_id=%s", project_code, run_id)
-            if trace:
-                trace.event(
-                    "run_complete_ok",
-                    project_target=project_code,
-                    target_run_id=run_id,
-                    **extra,
-                )
-            return
-        except ApiException as e:
-            http_status = getattr(e, "status", None)
-            if http_status == 429 and attempt < max_attempts - 1:
-                time.sleep(delay)
-                delay *= 2
-                continue
-            body = getattr(e, "body", None) or getattr(e, "reason", None) or str(e)
-            logger.warning(
-                "complete_run failed project=%s run_id=%s HTTP %s %s",
-                project_code,
-                run_id,
-                http_status,
-                (body[:500] if isinstance(body, str) else body),
-            )
-            if trace:
-                trace.event(
-                    "run_complete_failed",
-                    project_target=project_code,
-                    target_run_id=run_id,
-                    http_status=http_status,
-                    error_body=(body[:1200] if isinstance(body, str) else str(body)[:1200]),
-                    **extra,
-                )
-            return
-        except Exception as e:
-            logger.warning(
-                "complete_run failed project=%s run_id=%s: %s",
-                project_code,
-                run_id,
-                e,
-            )
-            if trace:
-                trace.event(
-                    "run_complete_failed",
-                    project_target=project_code,
-                    target_run_id=run_id,
-                    error=str(e),
-                    **extra,
-                )
-            return
-
-
 def _create_results_v2_with_retry(
     results_api: ResultsApi,
     project_code: str,
@@ -1244,6 +1207,76 @@ def _create_results_v2_with_retry(
                 )
             return False
     return False
+
+
+def _complete_target_run_safely(
+    runs_api: RunsApi,
+    project_code: str,
+    run_id: int,
+    max_attempts: int = 4,
+    trace: Any = None,
+    trace_extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Call complete_run without retry_with_backoff (avoids ERROR spam + swallowed failures on 4xx)."""
+    delay = 1.0
+    extra = dict(trace_extra or {})
+    for attempt in range(max_attempts):
+        try:
+            runs_api.complete_run(code=project_code, id=run_id)
+            step_log_info(
+                logger,
+                "complete_run ok project=%s run_id=%s",
+                project_code,
+                run_id,
+            )
+            if trace:
+                trace.event(
+                    "run_complete_ok",
+                    project_target=project_code,
+                    target_run_id=run_id,
+                    **extra,
+                )
+            return
+        except ApiException as e:
+            http_status = getattr(e, "status", None)
+            if http_status == 429 and attempt < max_attempts - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            body = getattr(e, "body", None) or getattr(e, "reason", None) or str(e)
+            logger.warning(
+                "complete_run failed project=%s run_id=%s HTTP %s %s",
+                project_code,
+                run_id,
+                http_status,
+                (body[:500] if isinstance(body, str) else body),
+            )
+            if trace:
+                trace.event(
+                    "run_complete_failed",
+                    project_target=project_code,
+                    target_run_id=run_id,
+                    http_status=http_status,
+                    error_body=(body[:1200] if isinstance(body, str) else str(body)[:1200]),
+                    **extra,
+                )
+            return
+        except Exception as e:
+            logger.warning(
+                "complete_run failed project=%s run_id=%s: %s",
+                project_code,
+                run_id,
+                e,
+            )
+            if trace:
+                trace.event(
+                    "run_complete_failed",
+                    project_target=project_code,
+                    target_run_id=run_id,
+                    error=str(e),
+                    **extra,
+                )
+            return
 
 
 def _result_rows_to_hash_set(rows: List[Any]) -> set:
@@ -1393,6 +1426,284 @@ def _augment_runs_to_complete_from_source_details(
         )
 
 
+def _build_batch_rows_for_source_run(
+    source_results: List[Any],
+    *,
+    source_service: QaseService,
+    project_code_source: str,
+    source_run_id: int,
+    target_run_id: int,
+    case_mapping: Dict[int, int],
+    mappings: MigrationMappings,
+    author_uuid_to_id_mapping: Dict[str, int],
+    attachment_mapping: Dict[str, str],
+    case_steps_cache: Dict[int, Dict[str, Any]],
+    cache_lock: Optional[threading.Lock],
+    trace: Any,
+    trace_full: bool,
+    row_max_workers: int,
+) -> List[Dict[str, Any]]:
+    trace_lock = threading.Lock() if trace else None
+
+    def _trace_event(name: str, **kwargs: Any) -> None:
+        if not trace:
+            return
+        if trace_lock is not None:
+            with trace_lock:
+                trace.event(name, **kwargs)
+        else:
+            trace.event(name, **kwargs)
+
+    def _process_one_raw(raw: Any) -> Optional[Dict[str, Any]]:
+        result_dict = raw if isinstance(raw, dict) else to_dict(raw)
+        raw_preview = {
+            "case_id": result_dict.get("case_id"),
+            "hash": result_dict.get("hash"),
+            "status_id": result_dict.get("status_id"),
+        }
+        result_dict = enrich_source_result_for_v2(
+            result_dict,
+            source_service,
+            project_code_source,
+            case_steps_cache,
+            cache_lock=cache_lock,
+        )
+
+        source_case_id = result_dict.get("case_id")
+        lookup_id: Any = source_case_id
+        if source_case_id is not None:
+            try:
+                lookup_id = int(source_case_id)
+            except (TypeError, ValueError):
+                pass
+        target_case_id = case_mapping.get(lookup_id)
+        if target_case_id is None and source_case_id is not None:
+            target_case_id = case_mapping.get(source_case_id)
+
+        if target_case_id is None:
+            _trace_event(
+                "result_standalone_no_testops_id",
+                project_source=project_code_source,
+                source_run_id=source_run_id,
+                target_run_id=target_run_id,
+                source_case_id=source_case_id,
+                lookup_id=lookup_id,
+                raw_preview=raw_preview,
+                enriched_summary=summarize_enriched_result(result_dict),
+            )
+
+        try:
+            rc = _source_to_result_create_v2(
+                result_dict,
+                target_case_id,
+                mappings,
+                author_uuid_to_id_mapping,
+                attachment_mapping,
+            )
+            _trace_event(
+                "result_row_built",
+                project_source=project_code_source,
+                source_run_id=source_run_id,
+                target_run_id=target_run_id,
+                source_case_id=source_case_id,
+                target_case_id=target_case_id,
+                raw_preview=raw_preview,
+                enriched=summarize_enriched_result(result_dict),
+                v2_create_summary=summarize_result_create(rc),
+            )
+            return {"source": result_dict, "create": rc}
+        except Exception as e:
+            logger.error("Error building v2 ResultCreate: %s", e, exc_info=True)
+            _trace_event(
+                "result_build_failed",
+                project_source=project_code_source,
+                source_run_id=source_run_id,
+                target_run_id=target_run_id,
+                source_case_id=source_case_id,
+                error=str(e),
+                enriched_summary=summarize_enriched_result(result_dict),
+            )
+            return None
+
+    n = len(source_results)
+    use_parallel = row_max_workers > 1 and n >= _RESULTS_ROW_PARALLEL_MIN
+    if not use_parallel:
+        out: List[Dict[str, Any]] = []
+        for raw in source_results:
+            row = _process_one_raw(raw)
+            if row:
+                out.append(row)
+        return out
+
+    workers = min(row_max_workers, n, _RESULTS_ROW_MAX_WORKERS)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_process_one_raw, raw) for raw in source_results]
+        out = []
+        for fut in futures:
+            row = fut.result()
+            if row:
+                out.append(row)
+    return out
+
+
+def _migrate_results_one_source_run(
+    source_run_id: int,
+    target_run_id: int,
+    *,
+    source_service: QaseService,
+    target_service: QaseService,
+    project_code_source: str,
+    project_code_target: str,
+    case_mapping: Dict[int, int],
+    mappings: MigrationMappings,
+    author_uuid_to_id_mapping: Dict[str, int],
+    attachment_mapping: Dict[str, str],
+    results_api_v2: ResultsApi,
+    case_steps_cache: Dict[int, Dict[str, Any]],
+    cache_lock: Optional[threading.Lock],
+    trace: Any,
+    trace_full: bool,
+    progress: Optional[Any],
+    row_max_workers: int,
+) -> Tuple[int, int, Dict[str, str]]:
+    """Returns (raw_result_count, created_count, hash_mapping_for_this_run)."""
+    local_hashes: Dict[str, str] = {}
+    source_results = extract_results(
+        source_service, project_code_source, source_run_id
+    )
+    if not source_results:
+        if trace:
+            trace.event(
+                "results_run_empty_extract",
+                project_source=project_code_source,
+                source_run_id=source_run_id,
+                target_run_id=target_run_id,
+            )
+        return 0, 0, {}
+
+    if trace:
+        trace.event(
+            "results_run_extracted",
+            project_source=project_code_source,
+            source_run_id=source_run_id,
+            target_run_id=target_run_id,
+            n_raw_results=len(source_results),
+        )
+
+    batch_rows = _build_batch_rows_for_source_run(
+        source_results,
+        source_service=source_service,
+        project_code_source=project_code_source,
+        source_run_id=source_run_id,
+        target_run_id=target_run_id,
+        case_mapping=case_mapping,
+        mappings=mappings,
+        author_uuid_to_id_mapping=author_uuid_to_id_mapping,
+        attachment_mapping=attachment_mapping,
+        case_steps_cache=case_steps_cache,
+        cache_lock=cache_lock,
+        trace=trace,
+        trace_full=trace_full,
+        row_max_workers=row_max_workers,
+    )
+
+    if not batch_rows:
+        if trace:
+            trace.event(
+                "results_run_no_rows_to_send",
+                project_source=project_code_source,
+                source_run_id=source_run_id,
+                target_run_id=target_run_id,
+                n_raw_results=len(source_results),
+            )
+        return len(source_results), 0, {}
+
+    seen_target_hashes = _collect_run_result_hashes(
+        target_service, project_code_target, int(target_run_id)
+    )
+    created = 0
+
+    for chunk_idx, chunk_rows in enumerate(chunks(batch_rows, 500)):
+        results_list: List[ResultCreate] = [r["create"] for r in chunk_rows]
+        request = CreateResultsRequestV2(results=results_list)
+
+        if trace:
+            trace.event(
+                "results_chunk_payload",
+                project_source=project_code_source,
+                source_run_id=source_run_id,
+                target_run_id=target_run_id,
+                chunk_index=chunk_idx,
+                chunk_size=len(chunk_rows),
+                payload=chunk_results_payload_for_trace(results_list, trace_full),
+            )
+
+        if _create_results_v2_with_retry(
+            results_api_v2,
+            project_code_target,
+            int(target_run_id),
+            request,
+            trace=trace,
+            trace_ctx={
+                "project_source": project_code_source,
+                "source_run_id": source_run_id,
+                "chunk_index": chunk_idx,
+                "chunk_size": len(chunk_rows),
+            },
+            full_payloads=trace_full,
+        ):
+            created += len(chunk_rows)
+            if progress:
+                progress.add_results(len(chunk_rows))
+            try:
+                after_hashes: set = set()
+                new_hashes: set = set()
+                delay_s = 0.0
+                for attempt in range(6):
+                    if delay_s > 0:
+                        time.sleep(delay_s)
+                    after_hashes = _collect_run_result_hashes(
+                        target_service, project_code_target, int(target_run_id)
+                    )
+                    new_hashes = after_hashes - seen_target_hashes
+                    if new_hashes or len(chunk_rows) == 0 or attempt == 5:
+                        break
+                    delay_s = 0.5 if attempt == 0 else min(0.5 * (2**attempt), 3.0)
+
+                target_results = extract_results(
+                    target_service, project_code_target, int(target_run_id)
+                )
+                _map_chunk_hashes_by_delta(
+                    chunk_rows,
+                    target_results,
+                    new_hashes,
+                    local_hashes,
+                )
+                seen_target_hashes = after_hashes
+            except Exception as hash_error:
+                logger.warning(
+                    "Could not map result hashes after v2 bulk run %s: %s",
+                    target_run_id,
+                    hash_error,
+                )
+        else:
+            logger.error(
+                "V2 results bulk failed for run %s (%s results in chunk)",
+                target_run_id,
+                len(chunk_rows),
+            )
+            if trace:
+                trace.event(
+                    "results_chunk_skipped_after_fail",
+                    project_source=project_code_source,
+                    source_run_id=source_run_id,
+                    target_run_id=target_run_id,
+                    chunk_index=chunk_idx,
+                )
+
+    return len(source_results), created, local_hashes
+
+
 def migrate_results(
     source_service: QaseService,
     target_service: QaseService,
@@ -1402,9 +1713,15 @@ def migrate_results(
     case_mapping: Dict[int, int],
     mappings: MigrationMappings,
     stats: MigrationStats,
+    progress: Optional["ProjectMigrationProgress"] = None,
 ) -> Dict[str, str]:
     """
     Migrate test results via API v2 bulk create, then map hashes using v1 list API.
+
+    Uses thread pools to overlap I/O: per-result enrichment (detail + case meta GETs)
+    in parallel within each run, and up to ``_RESULTS_RUN_PARALLEL_MAX`` runs at once
+    when the run mapping has multiple entries. Chunk POST + hash polling stay sequential
+    per target run to preserve ordering.
     """
     runs_api_target = RunsApi(target_service.client)
     result_hash_mapping: Dict[str, str] = {}
@@ -1438,201 +1755,64 @@ def migrate_results(
             attachment_mapping_size=len(attachment_mapping),
         )
 
-    for source_run_id, target_run_id in run_mapping.items():
-        source_results = extract_results(source_service, project_code_source, source_run_id)
-        if not source_results:
-            if trace:
-                trace.event(
-                    "results_run_empty_extract",
-                    project_source=project_code_source,
-                    source_run_id=source_run_id,
-                    target_run_id=target_run_id,
-                )
-            continue
-
-        if trace:
-            trace.event(
-                "results_run_extracted",
-                project_source=project_code_source,
-                source_run_id=source_run_id,
-                target_run_id=target_run_id,
-                n_raw_results=len(source_results),
-            )
-
-        batch_rows: List[Dict[str, Any]] = []
-
-        for raw in source_results:
-            total_results += 1
-            result_dict = raw if isinstance(raw, dict) else to_dict(raw)
-            raw_preview = {
-                "case_id": result_dict.get("case_id"),
-                "hash": result_dict.get("hash"),
-                "status_id": result_dict.get("status_id"),
-            }
-            result_dict = enrich_source_result_for_v2(
-                result_dict,
-                source_service,
-                project_code_source,
-                case_steps_cache,
-            )
-
-            source_case_id = result_dict.get("case_id")
-            lookup_id: Any = source_case_id
-            if source_case_id is not None:
-                try:
-                    lookup_id = int(source_case_id)
-                except (TypeError, ValueError):
-                    pass
-            target_case_id = case_mapping.get(lookup_id)
-            if target_case_id is None and source_case_id is not None:
-                target_case_id = case_mapping.get(source_case_id)
-
-            if target_case_id is None and trace:
-                trace.event(
-                    "result_standalone_no_testops_id",
-                    project_source=project_code_source,
-                    source_run_id=source_run_id,
-                    target_run_id=target_run_id,
-                    source_case_id=source_case_id,
-                    lookup_id=lookup_id,
-                    raw_preview=raw_preview,
-                    enriched_summary=summarize_enriched_result(result_dict),
-                )
-
-            try:
-                rc = _source_to_result_create_v2(
-                    result_dict,
-                    target_case_id,
-                    mappings,
-                    author_uuid_to_id_mapping,
-                    attachment_mapping,
-                )
-                batch_rows.append({"source": result_dict, "create": rc})
-                if trace:
-                    trace.event(
-                        "result_row_built",
-                        project_source=project_code_source,
-                        source_run_id=source_run_id,
-                        target_run_id=target_run_id,
-                        source_case_id=source_case_id,
-                        target_case_id=target_case_id,
-                        raw_preview=raw_preview,
-                        enriched=summarize_enriched_result(result_dict),
-                        v2_create_summary=summarize_result_create(rc),
-                    )
-            except Exception as e:
-                logger.error("Error building v2 ResultCreate: %s", e, exc_info=True)
-                if trace:
-                    trace.event(
-                        "result_build_failed",
-                        project_source=project_code_source,
-                        source_run_id=source_run_id,
-                        target_run_id=target_run_id,
-                        source_case_id=source_case_id,
-                        error=str(e),
-                        enriched_summary=summarize_enriched_result(result_dict),
-                    )
-                continue
-
-        if not batch_rows:
-            if trace:
-                trace.event(
-                    "results_run_no_rows_to_send",
-                    project_source=project_code_source,
-                    source_run_id=source_run_id,
-                    target_run_id=target_run_id,
-                    n_raw_results=len(source_results),
-                )
-            continue
-
-        seen_target_hashes = _collect_run_result_hashes(
-            target_service, project_code_target, int(target_run_id)
+    run_items = list(run_mapping.items())
+    n_runs = len(run_items)
+    run_workers = (
+        min(_RESULTS_RUN_PARALLEL_MAX, n_runs) if n_runs > 1 else 1
+    )
+    cpu_n = os.cpu_count() or 4
+    if run_workers == 1:
+        row_max_workers = min(
+            _RESULTS_ROW_MAX_WORKERS,
+            max(_RESULTS_ROW_MIN_WORKERS, cpu_n * 4),
+        )
+    else:
+        row_max_workers = max(
+            _RESULTS_ROW_MIN_WORKERS,
+            min(
+                _RESULTS_ROW_MAX_WORKERS,
+                max(_RESULTS_ROW_MIN_WORKERS, (cpu_n * 8) // run_workers),
+            ),
         )
 
-        for chunk_idx, chunk_rows in enumerate(chunks(batch_rows, 500)):
-            results_list: List[ResultCreate] = [r["create"] for r in chunk_rows]
-            request = CreateResultsRequestV2(results=results_list)
+    cache_lock: Optional[threading.Lock] = None
+    if run_workers > 1 or row_max_workers > 1:
+        cache_lock = threading.Lock()
 
-            if trace:
-                trace.event(
-                    "results_chunk_payload",
-                    project_source=project_code_source,
-                    source_run_id=source_run_id,
-                    target_run_id=target_run_id,
-                    chunk_index=chunk_idx,
-                    chunk_size=len(chunk_rows),
-                    payload=chunk_results_payload_for_trace(results_list, trace_full),
-                )
+    def _run_one(pair: Tuple[Any, Any]) -> Tuple[int, int, Dict[str, str]]:
+        s_raw, t_raw = pair
+        return _migrate_results_one_source_run(
+            int(s_raw),
+            int(t_raw),
+            source_service=source_service,
+            target_service=target_service,
+            project_code_source=project_code_source,
+            project_code_target=project_code_target,
+            case_mapping=case_mapping,
+            mappings=mappings,
+            author_uuid_to_id_mapping=author_uuid_to_id_mapping,
+            attachment_mapping=attachment_mapping,
+            results_api_v2=results_api_v2,
+            case_steps_cache=case_steps_cache,
+            cache_lock=cache_lock,
+            trace=trace,
+            trace_full=trace_full,
+            progress=progress,
+            row_max_workers=row_max_workers,
+        )
 
-            if _create_results_v2_with_retry(
-                results_api_v2,
-                project_code_target,
-                int(target_run_id),
-                request,
-                trace=trace,
-                trace_ctx={
-                    "project_source": project_code_source,
-                    "source_run_id": source_run_id,
-                    "chunk_index": chunk_idx,
-                    "chunk_size": len(chunk_rows),
-                },
-                full_payloads=trace_full,
-            ):
-                created_results += len(chunk_rows)
-                try:
-                    # v2 bulk may persist asynchronously. Wait until we see at least as many
-                    # new hashes as rows in this chunk (or exhaust attempts) so delta mapping
-                    # usually succeeds without fallback. Reuse the last list fetch — no extra
-                    # extract_results after polling.
-                    n_need = len(chunk_rows)
-                    max_poll = 8
-                    delay_s = 0.0
-                    target_results: List[Any] = []
-                    after_hashes: set = set()
-                    new_hashes: set = set()
-                    for attempt in range(max_poll):
-                        if delay_s > 0:
-                            time.sleep(delay_s)
-                        target_results = extract_results(
-                            target_service, project_code_target, int(target_run_id)
-                        )
-                        after_hashes = _result_rows_to_hash_set(target_results)
-                        new_hashes = after_hashes - seen_target_hashes
-                        if n_need == 0:
-                            break
-                        if len(new_hashes) >= n_need:
-                            break
-                        if attempt == max_poll - 1:
-                            break
-                        delay_s = 0.12 if attempt == 0 else min(0.2 * (1.55**attempt), 2.5)
-
-                    _map_chunk_hashes_by_delta(
-                        chunk_rows,
-                        target_results,
-                        new_hashes,
-                        result_hash_mapping,
-                    )
-                    seen_target_hashes = after_hashes
-                except Exception as hash_error:
-                    logger.debug(
-                        "Could not map result hashes after v2 bulk run %s: %s",
-                        target_run_id,
-                        hash_error,
-                    )
-            else:
-                logger.error(
-                    "V2 results bulk failed for run %s (%s results in chunk)",
-                    target_run_id,
-                    len(chunk_rows),
-                )
-                if trace:
-                    trace.event(
-                        "results_chunk_skipped_after_fail",
-                        project_source=project_code_source,
-                        source_run_id=source_run_id,
-                        target_run_id=target_run_id,
-                        chunk_index=chunk_idx,
-                    )
+    if run_workers == 1:
+        for pair in run_items:
+            ts, cs, hm = _run_one(pair)
+            total_results += ts
+            created_results += cs
+            result_hash_mapping.update(hm)
+    else:
+        with ThreadPoolExecutor(max_workers=run_workers) as run_pool:
+            for ts, cs, hm in run_pool.map(_run_one, run_items):
+                total_results += ts
+                created_results += cs
+                result_hash_mapping.update(hm)
 
     stats.add_entity("results", total_results, created_results)
 

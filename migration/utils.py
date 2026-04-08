@@ -7,7 +7,7 @@ import threading
 import time
 import hashlib
 import uuid
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 from qase.api_client_v1.exceptions import ApiException
 import requests
@@ -18,6 +18,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Bulk POSTs (cases, etc.) can exceed 60s server-side on api.qase.io.
+_QASE_RAW_BULK_TIMEOUT = (30.0, 180.0)  # (connect, read) seconds
 
 
 class MigrationMappings:
@@ -290,8 +293,8 @@ def retry_with_backoff(func, max_retries: int = 3, base_delay: float = 1.0, *arg
     
     Args:
         func: Function to retry
-        max_retries: Maximum number of retries
-        base_delay: Base delay in seconds
+        max_retries: Maximum number of attempts (not retries-after-first); default 3
+        base_delay: Base delay in seconds (doubled each 429/5xx retry)
         *args: Positional arguments for func
         **kwargs: Keyword arguments for func
     
@@ -305,9 +308,21 @@ def retry_with_backoff(func, max_retries: int = 3, base_delay: float = 1.0, *arg
             return result
         except ApiException as e:
             last_exception = e
-            if e.status == 429 or e.status >= 500:
+            status = getattr(e, "status", None)
+            retriable = status == 429 or (
+                status is not None and status >= 500
+            )
+            if retriable:
                 if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)
+                    delay = min(base_delay * (2 ** attempt), 60.0)
+                    logger.warning(
+                        "API status %s on %s (attempt %s/%s), retrying in %.1fs",
+                        status,
+                        getattr(func, "__name__", repr(func)),
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                    )
                     time.sleep(delay)
                     continue
             is_attachment_error = False
@@ -566,48 +581,74 @@ class QaseRawApiClient:
         # Convert UUIDs to strings before JSON serialization
         cases_serializable = convert_uuids_to_strings(cases)
         payload = {"cases": cases_serializable}
-        
-        try:
-            response = requests.post(url, headers=self.headers, json=payload, timeout=60)
+
+        for attempt in range(3):
+            if attempt:
+                time.sleep(min(2 ** (attempt - 1), 8))
+            try:
+                response = requests.post(
+                    url,
+                    headers=self.headers,
+                    json=payload,
+                    timeout=_QASE_RAW_BULK_TIMEOUT,
+                )
+            except requests.exceptions.ReadTimeout as e:
+                logger.warning(
+                    "create_cases_bulk read timeout (attempt %s/3) project=%s n_cases=%s: %s",
+                    attempt + 1,
+                    project_code,
+                    len(cases),
+                    e,
+                )
+                if attempt == 2:
+                    logger.error("Exception creating cases bulk: %s", e)
+                    return None
+                continue
+            except Exception as e:
+                logger.error("Exception creating cases bulk: %s", e)
+                return None
+
             if response.status_code == 200:
                 response_data = response.json()
-                if 'result' in response_data:
-                    if 'ids' in response_data['result']:
-                        return response_data['result']['ids']
-                    elif 'id' in response_data['result']:
-                        return [response_data['result']['id']]
+                if "result" in response_data:
+                    if "ids" in response_data["result"]:
+                        return response_data["result"]["ids"]
+                    if "id" in response_data["result"]:
+                        return [response_data["result"]["id"]]
                 return []
-            else:
-                logger.error(f"Failed to create cases bulk: {response.status_code} - {response.text}")
-                return None
-        except Exception as e:
-            logger.error(f"Exception creating cases bulk: {e}")
+            logger.error(
+                "Failed to create cases bulk: %s - %s",
+                response.status_code,
+                response.text,
+            )
             return None
-    
-    def create_results_bulk(self, project_code: str, run_id: int, results: List[Dict[str, Any]]) -> bool:
+
+    def create_results_bulk(
+        self, project_code: str, run_id: int, results: List[Dict[str, Any]]
+    ) -> bool:
         """
-        Create test results in bulk using raw HTTP API.
-        
-        Args:
-            project_code: Project code
-            run_id: Run ID
-            results: List of result dictionaries with case_id, status, author_id, etc.
-        
-        Returns:
-            True if successful, False otherwise
+        POST /v1/result/{code}/{run_id}/bulk — up to 2000 results per request.
+
+        Not used by the default results migration path (v2 ``create_results_v2``);
+        kept for ad-hoc or future bulk v1 flows.
         """
         url = f"{self.base_url}/result/{project_code}/{run_id}/bulk"
-        payload = {"results": results}
-        
+        payload = {"results": convert_uuids_to_strings(results)}
+
         try:
-            response = requests.post(url, headers=self.headers, json=payload, timeout=60)
+            response = requests.post(
+                url, headers=self.headers, json=payload, timeout=_QASE_RAW_BULK_TIMEOUT
+            )
             if response.status_code == 200:
                 return True
-            else:
-                logger.error(f"Failed to create results bulk: {response.status_code} - {response.text}")
-                return False
+            logger.error(
+                "Failed to create results bulk: %s %s",
+                response.status_code,
+                (response.text or "")[:800],
+            )
+            return False
         except Exception as e:
-            logger.error(f"Exception creating results bulk: {e}")
+            logger.error("Exception creating results bulk: %s", e)
             return False
 
     def patch_result(
@@ -643,33 +684,71 @@ class QaseRawApiClient:
         """
         Create a test run using raw HTTP API.
         This ensures milestone_id and other fields are properly sent.
-        
+        Retries on HTTP 429 and 5xx with exponential backoff (aligned with SDK path).
+
         Args:
             project_code: Project code
             run_data: Run data dictionary with title, description, milestone_id, etc.
-        
+
         Returns:
             Created run ID if successful, None otherwise
         """
         url = f"{self.base_url}/run/{project_code}"
-        
-        try:
-            response = requests.post(url, headers=self.headers, json=run_data, timeout=60)
-            if response.status_code == 200:
-                response_data = response.json()
-                if response_data.get('status') and response_data.get('result'):
-                    result = response_data['result']
-                    if isinstance(result, dict):
-                        return result.get('id')
-                    elif isinstance(result, int):
-                        return result
+        max_attempts = 7
+        delay = 1.5
+
+        for attempt in range(max_attempts):
+            try:
+                response = requests.post(
+                    url, headers=self.headers, json=run_data, timeout=60
+                )
+                if response.status_code == 200:
+                    response_data = response.json()
+                    if response_data.get("status") and response_data.get("result"):
+                        result = response_data["result"]
+                        if isinstance(result, dict):
+                            return result.get("id")
+                        if isinstance(result, int):
+                            return result
+                    return None
+
+                code = response.status_code
+                if code == 429 or (500 <= code <= 599):
+                    if attempt < max_attempts - 1:
+                        logger.warning(
+                            "create_run HTTP %s (attempt %s/%s), retrying in %.1fs — %s",
+                            code,
+                            attempt + 1,
+                            max_attempts,
+                            delay,
+                            (response.text or "")[:200],
+                        )
+                        time.sleep(delay)
+                        delay = min(delay * 2, 60.0)
+                        continue
+
+                logger.error(
+                    "Failed to create run: %s — %s",
+                    code,
+                    (response.text or "")[:500],
+                )
                 return None
-            else:
-                logger.error(f"Failed to create run: {response.status_code} - {response.text}")
+            except requests.exceptions.RequestException as e:
+                if attempt < max_attempts - 1:
+                    logger.warning(
+                        "create_run request error (attempt %s/%s), retrying in %.1fs: %s",
+                        attempt + 1,
+                        max_attempts,
+                        delay,
+                        e,
+                    )
+                    time.sleep(delay)
+                    delay = min(delay * 2, 60.0)
+                    continue
+                logger.error("Exception creating run: %s", e)
                 return None
-        except Exception as e:
-            logger.error(f"Exception creating run: {e}")
-            return None
+
+        return None
     
     def create_defect(self, project_code: str, defect_data: Dict[str, Any]) -> Optional[int]:
         """
