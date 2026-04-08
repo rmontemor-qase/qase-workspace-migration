@@ -1,0 +1,39 @@
+qase_service.py
+  8af300148d0f9b86 14-15,21-22,25-26,34-35,37,39,41
+migration/create/users.py
+  8af300148d0f9b86 6,34-136,162,261-291,339
+migration/create/results.py
+  8af300148d0f9b86 1249-1259,1268,1271,1328-1329,1583-1590,1593,1596,1599,1601,1603-1607,1617
+migrate_workspace.py
+  8af300148d0f9b86 94,101
+README.md
+  8af300148d0f9b86 5-6,13-14,16,24,64,98,100-102,105,108,110,112,114-121,124,126,128,130,132-138,140,142,144,146,148-154,156,158,160,162-165,167,169,171,173,175,177-179,181-183,185,187,189-199,201,203,205,207-219,246-248,252-255,265-266,268,270-271,301,303-304,310-312
+migration/extract/cases.py
+  8af300148d0f9b86 13,21
+example_config.json
+  8af300148d0f9b86 18-19
+migration/create/cases.py
+  8af300148d0f9b86 322
+MIGRATION_CHECKLIST.md
+  8af300148d0f9b86 250
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.6",
+  "base_commit_sha": "d26c817b3b6ed84261a6764be9e60c0e7c4460a0",
+  "prompts": {
+    "8af300148d0f9b86": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "a250b59a-d7f7-4b32-927f-b83863cb7f60",
+        "model": "composer-2"
+      },
+      "human_author": "rmontemor-qase",
+      "messages": [],
+      "total_additions": 370,
+      "total_deletions": 225,
+      "accepted_lines": 313,
+      "overriden_lines": 2
+    }
+  }
+}
