@@ -12,7 +12,7 @@ Connection settings are **host-driven**: set `host` (and optionally `scim_host`)
 - ✅ **Attachments**: Migrates attachments when referenced; see limitations for edge cases
 - ✅ **ID mapping**: Optionally preserves entity IDs or generates new ones (`options.preserve_ids` in `config.json`)
 - ✅ **Resume**: Can resume interrupted migrations from saved mappings (`options.resume`)
-- ✅ **Resilience**: Retry logic for rate limits; detailed logging and statistics
+- ✅ **Resilience**: Retries when Qase is temporarily busy; detailed logging and statistics
 - ✅ **Case list/create batching**: Test cases are read and created in batches of **20** against the API (works consistently on cloud and custom-domain instances)
 
 ## What this tool migrates (included scope)
@@ -251,19 +251,13 @@ Steps that are skipped via config (e.g. users) are omitted at runtime.
 
 ### Test case batch size
 
-Listing and creating test cases uses a fixed batch size of **20** per request. This matches stricter rate limits on many deployments without varying batch size by environment.
+Listing and creating test cases uses a fixed batch size of **20** per request for stable, predictable runs across Qase Cloud and custom-domain workspaces.
 
 ### API Tokens
 
 You need API tokens for both source and target workspaces. Get them from:
 - Qase Cloud: Settings → API Tokens
 - Qase Enterprise: Settings → API Tokens
-
-### Rate Limiting
-
-The script includes retry logic with exponential backoff for rate limiting. For large migrations:
-- Qase Cloud: ~100 requests/minute
-- Custom-domain / self-hosted deployments: limits are often configurable and higher
 
 ### ID preservation
 
@@ -278,7 +272,7 @@ The script includes retry logic with exponential backoff for rate limiting. For 
 
 ### Shared steps
 
-- At **project** scope, the script migrates shared steps before cases that reference them (implementation may use raw HTTP where the SDK is too strict).
+- At **project** scope, shared steps are migrated before cases that reference them.
 - **Workspace-level** shared step libraries are **not** in scope; see [Workspace level](#workspace-level) under limitations.
 
 ## Troubleshooting
@@ -288,10 +282,9 @@ The script includes retry logic with exponential backoff for rate limiting. For 
 - Verify API tokens are correct
 - Check token permissions in Qase settings
 
-### Rate Limiting (429)
+### Migration is slow or pauses
 
-- The script automatically retries with exponential backoff
-- For very large migrations, consider running during off-peak hours
+Large workspaces involve many API calls; runs can take hours. If Qase temporarily slows or blocks traffic, wait and run the migration again (use **`options.resume`**: **`true`** so completed work is not repeated).
 
 ### Missing Dependencies
 
