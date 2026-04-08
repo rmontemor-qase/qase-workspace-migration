@@ -1,0 +1,55 @@
+migration/extract/suites.py
+  8af300148d0f9b86 8,27,62-64
+migration/create/cases.py
+  8af300148d0f9b86 6,8-10,314-315,352-353,399-400
+migration/run_single_project.py
+  8af300148d0f9b86 13-18,47-50,56-61,74-95,102-105,109,111,127,144,160,176,192,208,216,233,247-248,256,267,274,301-303,305,322-332,342,345-347
+migration/create/defects.py
+  8af300148d0f9b86 8,96-100,102-107
+migration/extract/configurations.py
+  8af300148d0f9b86 8,25,42-47
+migration/extract/milestones.py
+  8af300148d0f9b86 8,25,51-56
+migration/create/runs.py
+  8af300148d0f9b86 5,13-15,79-81,150-153,287-288,290,363-364
+migrate_workspace.py
+  8af300148d0f9b86 14-15,18,47-63,335-341,357-360,362-385,401-402,418,429-431,433-438
+migration/utils.py
+  8af300148d0f9b86 10,22-24,296-297,311-315,317-325,584-610,613-617,619-623,625-628,630-633,636-637,639-641,644-649,651,687-688,692,697-734,736-748,750-751
+migration/extract/shared_steps.py
+  8af300148d0f9b86 8,25,54-59
+README.md
+  8af300148d0f9b86 17,201
+migration/create/results.py
+  8af300148d0f9b86 4-5,17,19,21-22,25,42,55-57,60-66,534,536-545,547-551,559,591-593,1226-1231,1429-1706,1716,1720-1724,1758-1775,1778-1802,1804-1815
+migration/progress.py
+  8af300148d0f9b86 1-301
+example_config.json
+  8af300148d0f9b86 30-31
+migration/extract/authors.py
+  8af300148d0f9b86 8,95-97
+migration/step_logging.py
+  8af300148d0f9b86 1-35
+migration/extract/projects.py
+  8af300148d0f9b86 58-78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.6",
+  "base_commit_sha": "4277e3a7c718b791c2dfa369dee731cba364f8dd",
+  "prompts": {
+    "8af300148d0f9b86": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "a250b59a-d7f7-4b32-927f-b83863cb7f60",
+        "model": "composer-2"
+      },
+      "human_author": "rmontemor-qase",
+      "messages": [],
+      "total_additions": 1612,
+      "total_deletions": 831,
+      "accepted_lines": 1198,
+      "overriden_lines": 0
+    }
+  }
+}
