@@ -259,10 +259,17 @@ def migrate_runs(
                     run_data_dict['milestone_id'] = mapped_milestone
             except (ValueError, TypeError):
                 pass
-        if run_dict.get('plan_id'):
-            mapped_plan = plan_mapping.get(run_dict.get('plan_id'))
-            if mapped_plan:
-                run_data_dict['plan_id'] = mapped_plan
+        # plan_id is intentionally NOT included in the create payload.
+        # Qase v1 POST /run/{code}: when both `plan_id` and `cases` are sent,
+        # the server ignores `cases` and expands the run's scope to the plan's
+        # full case set — making stats wrong (every migrated run gets the
+        # plan's total case count instead of the source run's scope).
+        # PATCH /run/{code}/{id} silently drops `plan_id`, so the link can't
+        # be restored post-create. Verified via verify_plan_cases_bug.py.
+        # Trade-off: target runs lose their plan association; case scope is
+        # preserved, which is what drives stats accuracy.
+        source_plan_id = run_dict.get('plan_id')
+        mapped_plan_id = plan_mapping.get(source_plan_id) if source_plan_id else None
 
         if trace:
             trace.event(
@@ -273,6 +280,8 @@ def migrate_runs(
                 extracted=summarize_source_run(run_dict),
                 target_cases_count=len(target_cases),
                 target_configs_count=len(target_configs),
+                source_plan_id=source_plan_id,
+                mapped_plan_id_dropped=mapped_plan_id,
             )
 
         # Use raw API client if milestone_id is present (SDK may not support it properly)
